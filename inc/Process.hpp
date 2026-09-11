@@ -88,6 +88,10 @@ public:
   largeint edge_count;
   largeint elim_cost;//Maxwell: the multiply count of vertex elimination
   largeint partition_count;//Maxwell SVEGP-22: partitions this rank recorded
+
+  //the pass an active must carry to be usable; see active::gen
+  largeint pass_gen;
+  largeint stale_reads;
   largeint productive_pass;//passes of the caller's section run since profiling ended
  
   std::vector<Vertex*> intmed_vec;
@@ -106,6 +110,16 @@ private:
 
   //give back every Vertex and both arenas' storage (Maxwell SVEGP-27)
   void destroy_graph();
+
+  /* True when x was recorded in an earlier pass (or never), so its idx and
+   * vtx name vertices that no longer exist. */
+  bool stale( const active & x ) const;
+
+  /* Make x belong to this pass, forgetting whatever it held.  Drops the
+   * pointer rather than following it. */
+  void adopt( const active & x ) const;
+
+  void report_stale_read();
 
   inline Vertex * vertex_on_rhs( const active & x );
 
@@ -208,6 +222,11 @@ public:
   //how many the whole tape was broken into, across every rank.  No message:
   //the profiling pass is identical everywhere, so every rank already knows.
   largeint get_total_partitions();
+
+  /* The checkpoint contract; see active::gen. */
+  largeint advance_pass();
+  largeint generation() const;
+  largeint get_stale_reads() const;
 
   //Maxwell SVEGP-32: end a pass by throwing, or by running the section to its end
   void set_break_mode( break_t mode );

@@ -15,7 +15,8 @@ idx(0),
 owner_idx(0),
 old_idx(0),
 val(0),
-vtx(NULL)
+vtx(NULL),
+gen(0)
 { 
   //cout << " active() called...(val = " << val << ")" << endl;
 }
@@ -26,7 +27,8 @@ idx(0),
 owner_idx(0),
 old_idx(0),
 val(a),
-vtx(NULL)
+vtx(NULL),
+gen(0)
 {
   //cout << "active( double ) called...(val = " << val << ")" << endl;	
 }
@@ -37,7 +39,8 @@ idx(0),
 owner_idx(0),
 old_idx(0),
 val(x.val),
-vtx(NULL)
+vtx(NULL),
+gen(0)
 {
   //if(!internals::skip_mode){
     reachable = x.reachable;

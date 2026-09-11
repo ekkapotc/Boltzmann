@@ -129,6 +129,14 @@ namespace boltzmann
    */
   largeint get_total_partitions();
 
+  /*
+   * How many times this rank's section read an active that did not survive
+   * checkpoint().  Nonzero means the Jacobian is wrong and the library said so
+   * on stderr; see active::gen.  Zero is the normal state, and the assertion a
+   * test should make.
+   */
+  largeint get_stale_reads();
+
   //the multiply count of vertex elimination performed on this rank
   largeint get_cost();
 

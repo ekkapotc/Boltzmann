@@ -146,6 +146,25 @@ public:
   mutable largeint old_idx;
   mutable double val;
   mutable internals::Vertex * vtx;
+
+  /*
+   * WHICH PASS THIS active BELONGS TO.  Ported from Maxwell, where it was
+   * added after chunking examples/pde here exposed the hole in both.
+   *
+   * checkpoint() restores the independents and the dependents and frees the
+   * whole graph; every other active is left holding idx and vtx that name
+   * vertices which no longer exist, and the new pass renumbers from the same
+   * base, so a stale idx can even collide with a live one.  Reading such an
+   * active spliced a freed vertex into the new graph -- AddressSanitizer
+   * caught it as a use-after-free in Vertex::kill(), and in the cases that did
+   * not crash the derivative silently came out zero.
+   *
+   * Process stamps this whenever it gives an active a vertex; restore_values()
+   * re-stamps the independents and the dependents at the top of every pass.
+   * An out-of-date stamp means the active did not survive the checkpoint.
+   * 0 is "never recorded", which is a freshly constructed active.
+   */
+  mutable largeint gen;
 		
 public:		
 

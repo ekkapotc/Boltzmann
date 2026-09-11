@@ -473,6 +473,78 @@ static void misuse_no_tape()
   ok("misuse: finalize with no tape is survivable", true);
 }
 
+
+/* M-08  An active that did not survive checkpoint() is caught, not followed.
+ *
+ *       Found by giving examples/pde a budget that chunks: it built its
+ *       Crank-Nicholson solver, and so its active work arrays, once outside
+ *       the checkpoint loop.  Safe only while the example never chunked.
+ *       AddressSanitizer caught the write path dereferencing a freed vertex
+ *       in Vertex::kill(); the read path was worse, because it did not crash
+ *       -- the derivative simply came out zero.  Maxwell had the same hole.
+ *
+ *       Two runs of one program differing only in where one active is
+ *       declared.  The correct one must stay correct and stay quiet; the
+ *       wrong one must be counted rather than dereferenced.
+ */
+static double stale_case( bool outside , largeint * reads )
+{
+  initialize(1,1,4000);
+
+  active x; x = 1.0; independent(x);
+  active y, carry;
+  int pass = 0;
+
+  run_tape( &x , y , [&]{
+    active u = x, local;
+    if(outside){ if(pass==0) carry = u*2.0; }
+    else       { local = u*2.0; }
+    for(int i=0;i<400;i++) u = u*1.0001 + 0.5;
+    active z = (outside ? carry : local) + u;
+    y = u;
+    (void)z;
+    pass++;
+  });
+
+  dependent(y);
+  Jacobian J = harvest(1,1);
+
+  const double   d = J.empty() ? 0.0 : J(0,0);
+  const largeint r = get_stale_reads();
+
+  finalize();
+
+  double sum = 0.0;
+  MPI_Allreduce(&d,&sum,1,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);//one contributor
+
+  long lr = (long)r, tr = 0;
+  MPI_Allreduce(&lr,&tr,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);//it can land on any rank
+  *reads = (largeint)tr;
+
+  return sum;
+}
+
+static void m08_stale_active()
+{
+  const double exact = std::pow(1.0001,400.0);
+
+  largeint r_in = 1, r_out = 0;
+
+  const double in = stale_case(false,&r_in);
+  ok("M-08 declared inside the section: the derivative is right",
+     std::fabs(in-exact) <= 1.0e-9*exact);
+  ok("M-08 declared inside the section: nothing is reported",
+     r_in==0);
+
+  const double out = stale_case(true,&r_out);
+  ok("M-08 declared outside: the stale read is counted, not dereferenced",
+     r_out>0);
+  ok("M-08 declared outside: the tape still finishes and harvests",
+     out==out);//not NaN: the run completed
+  ok("M-08 get_stale_reads() separates a clean tape from a dirty one",
+     r_in==0 && r_out>0);
+}
+
 int main( int argc , char ** argv )
 {
   (void)argc; (void)argv;
@@ -492,6 +564,7 @@ int main( int argc , char ** argv )
   m05_run_tape();
   m06_tape_independence();
   m07_total_partitions();
+  m08_stale_active();
 
   misuse_no_tape();//and again after every tape has been closed
 

@@ -1026,7 +1026,7 @@ static const char DEFAULT_SCENARIO[] =
  * elimination order.
  */
 static void run_one( const std::string & scen ,
-                     int Mv , int Nv , largeint budget ,
+                     int Mv , int Nv , largeint budget , break_t mode , int probe ,
                      std::vector<double> & g ,
                      largeint & parts , largeint & total ,
                      largeint & cost  , largeint & passes ,
@@ -1041,6 +1041,10 @@ static void run_one( const std::string & scen ,
   const unsigned int xmsz = 4+X.sigmaSq.a.size()+X.sigmaSq.b.size();
 
   initialize( (largeint)xmsz , 1 , budget );
+
+  set_break_mode(mode);
+
+  if(probe>0) set_probe_frequency(probe);
 
   std::vector<active*> XM(xmsz);
   XM[0]=&X.S0; XM[1]=&X.r; XM[2]=&X.K; XM[3]=&X.T;
@@ -1108,16 +1112,28 @@ int main( int argc , char* argv[] )
    * name still overrides it, and "-" means "the built-in one" so that M, N
    * and the budget can be given without naming a file.
    *
-   *     ./pde                                  built-in, M=50, N=100
+   *     ./pde                                  built-in, M=20, N=40, both modes
    *     ./pde scenario_5.in 100 200            a file, bigger grid
-   *     ./pde - 50 100 40000                   built-in, tighter budget
+   *     ./pde - 20 40 40000                    built-in, tighter budget
+   *     ./pde - 20 40 300000 break             BREAK_ON_TARGET only
+   *     ./pde - 20 40 300000 end               RUN_TO_END only
    */
   const char *   file   = (argc>1 && std::string(argv[1])!="-") ? argv[1] : 0;
   const int      Mv     = (argc>2) ? atoi(argv[2]) : 20;
   const int      Nv     = (argc>3) ? atoi(argv[3]) : 40;
   const largeint budget = (argc>4) ? (largeint)atol(argv[4]) : 300000;
+  const string   modearg= (argc>5) ? string(argv[5]) : string("both");
+  const int      probe   = (argc>6) ? atoi(argv[6]) : 0;//0 = library default
 
   if( Mv<1 || Nv<4 ){ cerr << "pde: need M>=1 and N>=4\n"; return 1; }
+
+  const bool do_break = (modearg=="both" || modearg=="break");
+  const bool do_end   = (modearg=="both" || modearg=="end");
+
+  if( !do_break && !do_end ){
+    cerr << "pde: mode must be break, end or both (got '" << modearg << "')\n";
+    return 1;
+  }
 
   M = Mv;
   N = Nv;
@@ -1134,17 +1150,59 @@ int main( int argc , char* argv[] )
 
   /* ---- the run under test: chunked ------------------------------------ */
 
+  const break_t first = do_break ? BREAK_ON_TARGET : RUN_TO_END;
+
   std::vector<double> gc;
   largeint parts=0, total=0, cost=0, passes=0;
   int      lib_ranks=0;
-  run_one( scen , Mv , Nv , budget , gc , parts , total , cost , passes , lib_ranks );
+  run_one( scen , Mv , Nv , budget , first , probe , gc , parts , total , cost , passes , lib_ranks );
+
+  /*
+   * THE OTHER BREAK MODE, same budget.
+   *
+   * BREAK_ON_TARGET ends a pass by throwing BreakException from inside
+   * whichever operator crossed the budget; RUN_TO_END lets the pass run its
+   * passive suffix out instead.  Neither touches what is recorded, so the two
+   * must produce the same partitions and the same doubles -- BIT FOR BIT, not
+   * to a tolerance.  Maxwell asserts this in examples/nobreak; here it also
+   * covers the pipeline, where the mode decides whether a rank can leave a
+   * section early while its neighbours are still sending to it.
+   *
+   * What the mode DOES change is the caller's scratch.  The throw leaves
+   * through the middle of the section at a point that appears nowhere in the
+   * source, so anything allocated with bare new[] and released at the bottom
+   * of the function is stranded -- once per pass, and there are as many passes
+   * as partitions.  This example survives it only because prepareRHS() and
+   * solveTridiagonalSystem() hold their scratch in unique_ptr and
+   * LocalVolSurface holds its coefficients in vector: unwinding releases all
+   * of it.  Swap those back to the raw new[]/delete[] pairs commented out
+   * beside them and the numbers are, measured under LeakSanitizer at np=1:
+   *
+   *     budget    partitions   BREAK_ON_TARGET leak   RUN_TO_END leak
+   *     600000        59          170928 bytes            none
+   *     300000       118          340152 bytes            none
+   *     150000       236          689688 bytes            none
+   *      75000       470         1381368 bytes            none
+   *
+   * Exactly linear in the partition count, which the caller does not choose
+   * and does not know until the profiling pass has run: halving the budget to
+   * fit a smaller machine doubles the leak.  With unique_ptr, both modes leak
+   * nothing.  That is the whole argument for RAII inside a checkpoint section.
+   */
+  std::vector<double> gm;
+  largeint mparts=0, mtotal=0, mcost=0, mpasses=0;
+  int      mranks=0;
+  const bool two_modes = (do_break && do_end);
+  if(two_modes){
+    run_one( scen , Mv , Nv , budget , RUN_TO_END , probe , gm , mparts , mtotal , mcost , mpasses , mranks );
+  }
 
   /* ---- the same program, told it has far more memory ------------------ */
 
   std::vector<double> gs;
   largeint sparts=0, stotal=0, scost=0, spasses=0;
   int      sranks=0;
-  run_one( scen , Mv , Nv , budget*64 , gs , sparts , stotal , scost , spasses , sranks );
+  run_one( scen , Mv , Nv , budget*64 , first , probe , gs , sparts , stotal , scost , spasses , sranks );
 
   /* ---- gather --------------------------------------------------------- */
 
@@ -1154,9 +1212,15 @@ int main( int argc , char* argv[] )
 
   const int nin = (int)gc.size();
 
-  std::vector<double> g(nin,0.0), gref(nin,0.0);
+  std::vector<double> g(nin,0.0), gref(nin,0.0), gmode(nin,0.0);
   MPI_Allreduce(&gc[0],&g[0]   ,nin,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);//one contributor
   MPI_Allreduce(&gs[0],&gref[0],nin,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+  if(two_modes){
+    MPI_Allreduce(&gm[0],&gmode[0],nin,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+  }
+
+  long lm=(long)mparts, mode_parts=0;
+  MPI_Allreduce(&lm,&mode_parts,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
 
   long lp=(long)parts, total_parts=0, min_parts=0, max_parts=0, ranks_working=0;
   long one = (parts>0) ? 1 : 0;
@@ -1187,6 +1251,8 @@ int main( int argc , char* argv[] )
    * orders above what is observed. */
   const double TOL = 1.0e-10;
 
+  double mode_rel = 0.0;
+
   int bad = 0;
 
   if( !(rel<=TOL) ){
@@ -1194,6 +1260,48 @@ int main( int argc , char* argv[] )
     if(!rank) printf("  FAIL chunked vs unchunked: %.3e relative at input %d, tol %.1e\n",
                      rel,where,TOL);
   }
+  /* Bit for bit, not to a tolerance: the two modes record the same graph. */
+  if(two_modes){
+    int mode_bits = 0; double mw = 0.0;
+    for( int i=0 ; i<nin ; i++ ){
+      if( g[i]!=gmode[i] ) mode_bits++;
+      const double d = fabs(g[i]-gmode[i]);
+      if(d>mw) mw = d;
+    }
+    mode_rel = (scale>0.0) ? mw/scale : mw;
+
+    if( !(mode_rel<=TOL) ){
+      bad++;
+      if(!rank) printf("  FAIL BREAK_ON_TARGET vs RUN_TO_END: %.3e relative, tol %.1e\n",
+                       mode_rel,TOL);
+    }
+    /*
+     * BIT FOR BIT, BUT ONLY AT ONE RANK -- and that is not a concession, it is
+     * a measured property of the pipeline.  While a rank waits for the edges
+     * coming from its neighbour it keeps eliminating its own vertices, polling
+     * MPI_Iprobe every set_probe_frequency() vertices and breaking out the
+     * moment the message lands.  How many it got through before that happens
+     * is a race, and it decides the elimination order, so the last bits move.
+     *
+     * Run the same program twice at np=2 and it disagrees with ITSELF by about
+     * 1e-13 relative -- nothing to do with the break mode, which is why this
+     * example measured that first.  Set the probe frequency high enough that
+     * the poll never fires early (argument 6, try 1000000000) and np=2 becomes
+     * bit-reproducible again: determinism and latency hiding are the same
+     * knob.  invariants pins its hash at np=1 only for exactly this reason.
+     */
+    if( size==1 && mode_bits ){
+      bad++;
+      if(!rank) printf("  FAIL at one rank the two modes must be bit-identical, "
+                       "%d of %d entries differ\n",mode_bits,nin);
+    }
+    if( mode_parts != total_parts ){
+      bad++;
+      if(!rank) printf("  FAIL RUN_TO_END recorded %ld partitions, BREAK_ON_TARGET %ld\n",
+                       mode_parts,total_parts);
+    }
+  }
+
   if( total != (largeint)total_parts ){
     bad++;
     if(!rank) printf("  FAIL library reports %lu partitions, the ranks recorded %ld\n",
@@ -1238,6 +1346,13 @@ int main( int argc , char* argv[] )
     printf("  elim cost    %ld total\n",total_cost);
     printf("  budget %lu vs %lu bytes: %ld partitions vs %ld, gradients agree to %.3e  (tol %.1e)\n",
            (unsigned long)budget,(unsigned long)(budget*64),total_parts,few_parts,rel,TOL);
+    if(two_modes){
+      printf("  break mode   BREAK_ON_TARGET vs RUN_TO_END: %ld partitions each, "
+             "gradients agree to %.3e%s\n",
+             total_parts,mode_rel,(size==1)?"  (bit for bit at np=1)":"");
+    }else{
+      printf("  break mode   %s only\n",do_break?"BREAK_ON_TARGET":"RUN_TO_END");
+    }
     printf("  dV/dS0 = %.12e   dV/dr = %.12e\n",g[0],g[1]);
     printf("  dV/dK  = %.12e   dV/dT = %.12e\n",g[2],g[3]);
     printf("pde: %s\n",(bad==0)?"PASS":"FAIL");

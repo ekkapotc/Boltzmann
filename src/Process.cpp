@@ -69,6 +69,8 @@ dep_count(0),
 edge_count(0),
 elim_cost(0),
 partition_count(0),
+pass_gen(1),
+stale_reads(0),
 productive_pass(0),
 dependent_index(0)
 {
@@ -134,8 +136,83 @@ Process::~Process()
 
 //private member functions
 
+/*
+ * THE CHECKPOINT CONTRACT, ENFORCED.  Ported from Maxwell; found here, by
+ * giving examples/pde a budget that actually chunks.
+ *
+ * checkpoint() restores the independents and the dependents and frees the
+ * whole graph.  Every other active keeps an idx and a vtx naming vertices that
+ * were destroyed, and the next pass renumbers from the same base, so a stale
+ * idx can collide with a live one.  Before this, reading such an active
+ * spliced a freed vertex into the new graph: AddressSanitizer caught it as a
+ * use-after-free in Vertex::kill() from set_vertex_dead(), and where the
+ * allocator happened not to reuse the block the derivative simply came out
+ * zero with no complaint at all.
+ */
+bool Process::stale( const active & x ) const
+{
+  return x.gen != pass_gen;
+}
+
+void Process::adopt( const active & x ) const
+{
+  x.gen     = pass_gen;
+  x.idx     = 0;
+  x.old_idx = 0;
+  x.vtx     = NULL;
+}
+
+largeint Process::advance_pass()
+{
+  return ++pass_gen;
+}
+
+largeint Process::generation() const
+{
+  return pass_gen;
+}
+
+largeint Process::get_stale_reads() const
+{
+  return stale_reads;
+}
+
+/*
+ * Once, not once per operator, and prefixed with the rank: a section that does
+ * this does it thousands of times on every rank at once, and the first message
+ * is the one that tells you where to look.  The count is readable with
+ * get_stale_reads() so a test can assert it.
+ */
+void Process::report_stale_read()
+{
+  if(!stale_reads){
+    std::cerr <<
+      "boltzmann: an active that did not survive checkpoint() has been read.\n"
+      "           Only the independents and the dependents handed to\n"
+      "           checkpoint() are restored between passes; everything else is\n"
+      "           left pointing at a graph that has been freed.  It is being\n"
+      "           treated as a constant, so any derivative that flows through\n"
+      "           it will be WRONG.  Build the section's own variables inside\n"
+      "           the section.\n"
+      "           (reported once per rank; see get_stale_reads() for the count)\n";
+  }
+  stale_reads++;
+}
+
 Vertex * Process::vertex_on_rhs( const active & x )
 {
+  /*
+   * A READ.  This is the one that was silently wrong, so it is the one that
+   * reports.  NULL means "no vertex": add_edge() already drops a null operand,
+   * so the stale value is used as a constant and contributes no derivative --
+   * which is what it was doing anyway, now defined and audible.
+   */
+  if( stale(x) ){
+    report_stale_read();
+    adopt(x);
+    return NULL;
+  }
+
   if(is_proc())
   {
     if(x.owner_idx==next_owner_idx)
@@ -169,6 +246,8 @@ Vertex * Process::vertex_on_rhs( const active & x )
 
 Vertex * Process::vertex_on_lhs( const active & x )
 {
+  x.gen = pass_gen;//a write: this active now belongs to this pass
+
   intmed_count++;
  
   if(is_proc())
@@ -192,6 +271,17 @@ Vertex * Process::vertex_on_lhs( const active & x )
 
 void Process::set_vertex_dead( const active & x )
 {
+  /*
+   * A WRITE.  Overwriting an active that did not survive the checkpoint is not
+   * an error -- it is how a scratch variable declared outside the section gets
+   * reused -- but the vertex it used to name is gone.  Drop it.  This is the
+   * line that dereferenced freed memory in pde.
+   */
+  if( stale(x) ){
+    adopt(x);
+    return;
+  }
+
   if(is_proc())
   {
     if(x.idx)
@@ -214,6 +304,17 @@ void Process::set_vertex_dead( const active & x )
 
 Vertex * Process::set_vertex_dead_for_unary_op_ass( const active & x )
 {
+  /*
+   * x op= c is a READ as well as a write -- the new value depends on the old
+   * one -- so a stale x here loses a derivative path and is reported, unlike
+   * the plain overwrite in set_vertex_dead().
+   */
+  if( stale(x) ){
+    report_stale_read();
+    adopt(x);
+    return NULL;
+  }
+
   if(is_proc())
   {
     if(x.idx)
@@ -267,6 +368,13 @@ Vertex * Process::set_vertex_dead_for_unary_op_ass( const active & x )
 
 Vertex * Process::set_vertex_dead_for_binary_op_ass( const active & x , bool & meaningful )
 {
+  if( stale(x) ){//x op= y reads x; see set_vertex_dead_for_unary_op_ass()
+    report_stale_read();
+    adopt(x);
+    meaningful = false;
+    return NULL;
+  }
+
   if(is_proc())
   {
     if(x.idx)
@@ -925,6 +1033,7 @@ void Process::register_indep_vertex( const active & x )
 {
   if(profiling)
   {
+    x.gen = pass_gen;//an independent belongs to every pass; restore_values re-stamps it
     x.reachable = true;
     x.idx = next_vertex_idx;
     //x.owner_idx = next_owner_idx;//redundant ? 

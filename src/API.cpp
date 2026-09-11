@@ -749,6 +749,13 @@ largeint boltzmann::get_partitions()
   return 0;
 }
 
+largeint boltzmann::get_stale_reads()
+{
+  TapeState * tp = current_tape();
+  if(tp){ return tp->proc.get_stale_reads(); }
+  return 0;
+}
+
 largeint boltzmann::get_total_partitions()
 {
   TapeState * tp = current_tape();
@@ -820,12 +827,20 @@ void boltzmann::internals::restore_values( active * x , active & y )
 {
   TapeState * tp = current_tape();
 
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * tells the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
+
   //y should be reinitialized before x because y could use the same program variable as one of x
   y.reachable = false;
   y.idx = 0;
   y.owner_idx = 0;
   y.val = 0.0;
   y.vtx = NULL;
+  y.gen = g;
 
   for( largeint i=0 ; i<tp->independent_size ; i++ ){
     x[i].reachable = true;
@@ -833,6 +848,7 @@ void boltzmann::internals::restore_values( active * x , active & y )
     x[i].owner_idx = 0;
     x[i].val = tp->indep_shadow_copy[i];
     x[i].vtx = NULL;
+    x[i].gen = g;
   }
 }
 
@@ -840,12 +856,20 @@ void boltzmann::internals::restore_values( active ** x , active & y )
 {
   TapeState * tp = current_tape();
 
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * tells the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
+
   //y should be reinitialized before x because y could use the same program variable as one of x
   y.reachable = false;
   y.idx = 0;
   y.owner_idx = 0;
   y.val = 0.0;
   y.vtx = NULL;
+  y.gen = g;
 
   for( largeint i=0 ; i<tp->independent_size ; i++ ){
     (*x[i]).reachable = true;
@@ -853,6 +877,7 @@ void boltzmann::internals::restore_values( active ** x , active & y )
     (*x[i]).owner_idx = 0;
     (*x[i]).val = tp->indep_shadow_copy[i];
     (*x[i]).vtx = NULL;
+    (*x[i]).gen = g;
   }
 }
 
@@ -860,12 +885,20 @@ void boltzmann::internals::restore_values( active * x , active * y )
 {
   TapeState * tp = current_tape();
 
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * tells the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
+
   for( largeint i=0 ; i<tp->dependent_size ; i++ ){
     y[i].reachable = false;
     y[i].idx = 0;
     y[i].owner_idx = 0;
     y[i].val = 0.0;
     y[i].vtx = NULL;
+    y[i].gen = g;
   }
 
   for( largeint i=0 ; i<tp->independent_size ; i++ ){
@@ -874,12 +907,20 @@ void boltzmann::internals::restore_values( active * x , active * y )
     x[i].owner_idx = 0;
     x[i].val = tp->indep_shadow_copy[i];
     x[i].vtx = NULL;
+    x[i].gen = g;
   }
 }
 
 void boltzmann::internals::restore_values( active ** x , active ** y )
 {
   TapeState * tp = current_tape();
+
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * tells the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
 
   for( largeint i=0 ; i<tp->dep_rows ; i++ ){
     for( largeint j=0 ; j<tp->dep_cols ; j++ ){
@@ -888,6 +929,7 @@ void boltzmann::internals::restore_values( active ** x , active ** y )
       y[i][j].owner_idx = 0;
       y[i][j].val = 0.0;
       y[i][j].vtx = NULL;
+      y[i][j].gen = g;
     }
   }
 
@@ -898,6 +940,7 @@ void boltzmann::internals::restore_values( active ** x , active ** y )
       x[i][j].owner_idx = 0;
       x[i][j].val = tp->indep_shadow_copy[tp->indep_cols*i+j];
       x[i][j].vtx = NULL;
+      x[i][j].gen = g;
     }
   }
 }
