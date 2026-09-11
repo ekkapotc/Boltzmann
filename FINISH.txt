@@ -1,0 +1,86 @@
+Boltzmann-new -- the finished tree, restructured.
+
+This folder is the whole library, already restructured to Maxwell's layout and
+with section 6.1 applied.  It is a fresh folder rather than an edit of the old
+one because the desktop bridge can write files but cannot DELETE them, and the
+restructure is mostly deletions: test/ has to go, and the old folder had also
+collected loose patches and duplicate downloads (boltzmann-1.hpp, rename-1.sh,
+ADAPT-...-1.md) that would have stayed behind.
+
+TWO STEPS, both in Explorer:
+
+    1  delete  Downloads\projects\Boltzmann
+    2  rename  Downloads\projects\Boltzmann-new   ->   Boltzmann
+
+Then, from inside it:
+
+    make
+    make ranks
+
+Nothing else.  There is no patch to apply and no git command needed.
+
+WHAT IS IN HERE, AND WHAT IS NOT
+
+  inc/                 10 headers, including the two new ones from 6.1
+                       (TapeState.hpp, Run.hpp)
+  src/                 6 translation units
+  examples/            14 directories, all of which build and run, plus
+                       common.mk and the discovering Makefile
+  backup_20260911/     the six pre-checkpoint examples, main.cpp each, with a
+                       README saying how to port one back
+  boltzmann.hpp        the public surface
+  Makefile             make / test / ranks / list / sanitize / clean / help
+  rename.sh            the migration script, kept as the record of the rename
+  ADAPT-FROM-MAXWELL-2026-09-11.md
+
+  NOT in here: build/ (generated -- `make` creates it), test/ (that is the
+  point), and none of the loose scaffolding from the old folder.
+
+THE MAKEFILES ARRIVED AS .new AND .gitignore AS gitignore.txt
+
+Seventeen files named Makefile, and one dotfile.  The bridge refuses both
+names.  Rename them in one go from inside the folder:
+
+  PowerShell:
+      Get-ChildItem -Recurse -Filter Makefile.new |
+          ForEach-Object { Move-Item -Force $_.FullName ($_.FullName -replace '\.new$','') }
+      Move-Item -Force gitignore.txt .gitignore
+
+  Git Bash / WSL:
+      find . -name 'Makefile.new' -execdir sh -c 'mv -f Makefile.new Makefile' \;
+      mv -f gitignore.txt .gitignore
+
+.gitignore only matters if you put the tree under git; the build does not
+need it.
+
+VERSION CONTROL, IF YOU WANT IT
+
+boltzmann.bundle sits next to this folder in Downloads\projects and now holds
+SIX commits -- the four from before plus 6.1 and the restructure.  Its last
+commit is exactly this tree, so the simplest route is to skip the two steps
+above entirely and instead, from Downloads\projects:
+
+    git clone boltzmann.bundle Boltzmann2
+    cd Boltzmann2
+    git remote remove origin
+    make && make ranks
+
+That gives you the same tree WITH the history and with the Makefiles and
+.gitignore already correctly named -- no renaming step at all.  Then delete
+both Boltzmann and Boltzmann-new and rename Boltzmann2.
+
+    181f13a  The tree as it stood on 2026-09-11, before review
+    edce7cf  Fix six critical defects found by review
+    1ab3b80  Adapt Maxwell: arenas, honest budget, header hygiene, a test suite
+    81917ca  Rename to Boltzmann
+    81174b5  6.1: one object owns one tape, and the library owns the loop
+    3100a7e  Restructure to Maxwell's layout: test/ becomes examples/
+
+VERIFIED, on this exact tree
+
+  library builds with zero warnings under -Wall -Wextra
+  seven pinned invariants bit-identical at 1, 2, 3 and 4 ranks
+  fdcheck   48 checks, 0 failures
+  regress   50 checks, 0 failures
+  make test green across all fourteen examples
+  make sanitize clean under AddressSanitizer and LeakSanitizer

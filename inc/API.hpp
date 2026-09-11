@@ -116,6 +116,19 @@ namespace boltzmann
    */
   largeint get_partitions();
 
+  /*
+   * How many partitions the whole tape was broken into, across every rank.
+   *
+   * NEEDS NO COMMUNICATION: the profiling pass is identical on every rank, so
+   * every one of them has known this number since before the first productive
+   * pass.  get_partitions() is this rank's share of it, and summing that over
+   * the communicator gives the same answer the expensive way.
+   *
+   * Zero until the profiling pass has finished, i.e. until the checkpoint
+   * loop has run at least twice.
+   */
+  largeint get_total_partitions();
+
   //the multiply count of vertex elimination performed on this rank
   largeint get_cost();
 

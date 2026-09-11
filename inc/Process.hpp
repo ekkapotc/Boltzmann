@@ -205,6 +205,10 @@ public:
 
   largeint get_partitions();
 
+  //how many the whole tape was broken into, across every rank.  No message:
+  //the profiling pass is identical everywhere, so every rank already knows.
+  largeint get_total_partitions();
+
   //Maxwell SVEGP-32: end a pass by throwing, or by running the section to its end
   void set_break_mode( break_t mode );
 

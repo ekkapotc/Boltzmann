@@ -749,6 +749,17 @@ largeint boltzmann::get_partitions()
   return 0;
 }
 
+largeint boltzmann::get_total_partitions()
+{
+  TapeState * tp = current_tape();
+
+  if(tp){
+    return tp->proc.get_total_partitions();
+  }
+
+  return 0;
+}
+
 largeint boltzmann::get_cost()
 {
   TapeState * tp = current_tape();

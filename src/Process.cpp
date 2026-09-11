@@ -1334,6 +1334,27 @@ largeint Process::get_partitions()
   return partition_count;
 }
 
+/*
+ * How many partitions the whole tape was broken into, across every rank --
+ * AND IT COSTS NO MESSAGE.
+ *
+ * topmost_owner_idx is set by finalize() at the end of the profiling pass,
+ * and the profiling pass is identical on every rank: it builds no graph, only
+ * counts, and the counting is a deterministic function of the operation
+ * sequence.  So every rank already knows the total, and has since before the
+ * first productive pass.  terminate() and the PASSES_COLLECTIVE branch both
+ * rely on exactly that.
+ *
+ * Which means a caller asking "how big did this tape get?" should not have to
+ * MPI_Allreduce get_partitions() -- every example that wanted the number was
+ * reducing something the library could have handed over.  Zero before the
+ * profiling pass has finished, like get_partitions().
+ */
+largeint Process::get_total_partitions()
+{
+  return topmost_owner_idx;
+}
+
 void Process::set_break_mode( break_t mode )
 {
   break_mode = mode;

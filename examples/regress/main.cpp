@@ -384,6 +384,41 @@ static void m06_tape_independence()
   ok("M-06 no tape means no memory reported", get_memory()==0 && get_heap()==0);
 }
 
+/* M-07  get_total_partitions() is the tape's partition count known LOCALLY,
+ *       without a message: the profiling pass is identical on every rank, so
+ *       every rank has the number before the first productive pass.  Assert
+ *       it against the expensive answer -- the reduced sum of each rank's
+ *       own share -- at whatever rank count this is running on. */
+static void m07_total_partitions()
+{
+  initialize(1,1,400);
+
+  active x,y; x = 0.45; independent(x);
+
+  run_tape( &x , y , [&]{
+    active u=x; for(int i=0;i<16;i++) u = 0.5*u + sin(u)*cos(u); y = u;
+  });
+
+  dependent(y);
+  Jacobian J = harvest(1,1);
+
+  const largeint lib   = get_total_partitions();
+  const long     mine  = (long)get_partitions();
+  const int      ranks = MPI_size();
+
+  finalize();
+
+  long summed = 0;
+  MPI_Allreduce(&mine,&summed,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
+
+  int sz=0; MPI_Comm_size(MPI_COMM_WORLD,&sz);
+
+  ok("M-07 get_total_partitions equals the reduced per-rank sum",
+     (long)lib == summed);
+  ok("M-07 the tape really did chunk, so the check means something", summed > 1);
+  ok("M-07 MPI_size agrees with the communicator", ranks == sz);
+}
+
 /* ------------------------------------------------------------------------
  * Misuse: every public entry point with no tape open.  None may crash.
  * ---------------------------------------------------------------------- */
@@ -410,6 +445,7 @@ static void misuse_no_tape()
   set_break_mode(RUN_TO_END);
   set_pass_mode(PASSES_COLLECTIVE);
   set_probe_frequency(10);
+  (void)get_total_partitions();
 
   ok("misuse: harvest with no tape is empty", J.empty());
   ok("misuse: MPI_rank with no tape is -1", MPI_rank()==-1);
@@ -417,6 +453,7 @@ static void misuse_no_tape()
   ok("misuse: get_memory with no tape is 0", get_memory()==0);
   ok("misuse: get_heap with no tape is 0", get_heap()==0);
   ok("misuse: get_partitions with no tape is 0", get_partitions()==0);
+  ok("misuse: get_total_partitions with no tape is 0", get_total_partitions()==0);
   ok("misuse: get_cost with no tape is 0", get_cost()==0);
   ok("misuse: is_harvesting_rank with no tape is false", !is_harvesting_rank());
 
@@ -454,6 +491,7 @@ int main( int argc , char ** argv )
   m04_free_jacobian();
   m05_run_tape();
   m06_tape_independence();
+  m07_total_partitions();
 
   misuse_no_tape();//and again after every tape has been closed
 

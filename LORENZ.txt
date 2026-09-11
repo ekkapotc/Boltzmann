@@ -1,0 +1,93 @@
+examples/lorenz -- a scientific test case that chunks hard, across ranks.
+
+WHAT IT IS
+
+Lorenz's 1963 convection model, marched 2000 steps with classical RK4.  The
+Jacobian of the final state with respect to the initial state is the
+TANGENT-LINEAR PROPAGATOR M(T) -- the object at the centre of 4D-Var data
+assimilation and of Lyapunov analysis, and a genuinely hard thing to obtain by
+finite differences, because the system is chaotic: a perturbation grows like
+e^(0.9t), so the step small enough to stay linear is too small to stay
+accurate.  That is the practical argument for AD on this problem.
+
+WHY IT CHUNKS
+
+A long time integration of a 3-variable system makes a tape that is DEEP and
+NARROW -- exactly the shape the checkpointing machinery is for.  At the
+default 180 kB budget the 2000 steps break into 148 partitions, dealt round
+the ranks:
+
+    np=1   148
+    np=2    74  74
+    np=3    49  50  49
+    np=4    37  37  37  37
+    np=7    21  22  21  22  21  22  21
+
+AND IT ASSERTS THAT, rather than observing it.  Fewer than eight partitions
+is a failure, and so is every partition landing on one rank when np>1.  An
+example that silently stops chunking stops testing anything; in a pipeline
+there is a second way to stop testing -- chunk, but onto a single rank -- and
+both are failures here.  Verified by running with a 100 MB budget, where both
+assertions fire and the example exits non-zero.
+
+TWO CHECKS, NEITHER A FINITE DIFFERENCE
+
+ 1  THE VARIATIONAL EQUATION.  dM/dt = J(u)M integrated alongside the state in
+    plain doubles, no AD anywhere.  For a Runge-Kutta method the
+    tangent-linear of the scheme IS the scheme applied to the variational
+    equation with the same stage values, so this agrees to MACHINE PRECISION
+    rather than to discretisation order.  Observed 4.5e-15 to 8.4e-15 at every
+    rank count, against a 1e-11 tolerance.
+
+ 2  LIOUVILLE'S THEOREM.  Lorenz's field has constant divergence
+    -(s+1+b) = -13.667, so det M(T) = exp(-13.667 T) exactly.  An analytic
+    identity binding all nine entries at once -- nothing agreeing with another
+    numerical propagator would satisfy it by accident.
+
+THE SECOND CHECK FINDS ITS OWN LIMIT, AND SAYS SO
+
+det M is the product of the three singular values: one grows like e^(0.9T)
+while the product shrinks like e^(-13.67T), so the determinant is a tiny
+number formed by cancellation between entries that are not tiny.  Computing it
+costs eps*||M||^3/|det M| in relative terms:
+
+    T=0.25   5e-14        T=1.0   4e-7
+    T=0.5    1e-11        T=2.0   larger than 1
+
+Measured at T=2: the Liouville residual was 8e-2 at one rank and 2.0 at four,
+while the tangent-linear check held at 3e-15 at every rank count.  The
+determinant disagreeing across rank counts there is NOT the library computing
+a different answer -- it is the same one-ulp reassociation the invariants
+suite pins, amplified by 1e14.
+
+So the example works that bound out from the Jacobian it actually produced,
+adds the RK4 discretisation error, and asserts Liouville only where double
+precision can resolve it.  Past that point it prints the check as NOT
+RESOLVABLE with the numbers and moves on.  A test that quietly widens its
+tolerance until it passes is worse than no test.
+
+    ./lorenz [steps] [budget_bytes] [dt]        default: 2000 180000 0.00025
+
+Try `mpirun -np 2 build/bin/lorenz 2000 180000 0.001` to see the unresolvable
+branch, and `... 2000 100000000 0.00025` to see the chunking assertions fire.
+
+HOW TO INSTALL IT
+
+With git, from inside Boltzmann:
+
+    git am 0003-examples-lorenz.patch
+
+Without git: create examples/lorenz/, put main.cpp in it, put
+examples/lorenz/Makefile.new there as Makefile, and replace examples/Makefile
+and the top-level Makefile with the two Makefile.new files here (lorenz is
+added to the fast group, to `make ranks` and to `make sanitize`).  README and
+the design note are updated too.
+
+boltzmann.bundle here is refreshed to seven commits, the last being this one.
+
+VERIFIED
+
+  0.3 s at np=2
+  PASS at 1, 2, 3, 4, 5 and 7 ranks
+  whole suite green, make sanitize clean under ASan and LSan
+  zero library warnings
