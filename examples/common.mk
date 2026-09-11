@@ -44,6 +44,12 @@ CXX := mpic++
 endif
 MPIRUN     ?= mpirun
 NP         ?= 2
+
+# Set and exported by ../../Makefile, which explains what it is for.  The
+# fallback is here so that `make run` works in an example directory on its own,
+# without going through the top-level Makefile: Open MPI needs --oversubscribe
+# to accept -np greater than the core count, MPICH rejects the flag.
+MPIRUN_FLAGS ?= $(shell $(MPIRUN) --version 2>&1 | grep -qi 'open[ -]*mpi' && echo --oversubscribe)
 BASE_FLAGS ?= -g -std=gnu++0x -Wall -Wextra
 EXTRA_FLAGS ?=
 FLAGS       = $(BASE_FLAGS) $(EXTRA_FLAGS)
@@ -68,10 +74,10 @@ $(OBJ_DIR) $(BIN_DIR):
 	@mkdir -p $@
 
 run: all
-	$(MPIRUN) -np $(NP) $(PROG) $(RUNARGS)
+	$(MPIRUN) $(MPIRUN_FLAGS) -np $(NP) $(PROG) $(RUNARGS)
 
 echo-args:
-	@echo "-np $(NP) $(RUNARGS)"
+	@echo "$(MPIRUN_FLAGS) -np $(NP) $(RUNARGS)"
 
 clean:
 	@rm -rf $(OBJ) $(PROG) test.*.er output*.txt job.sh core* *.btr *.o main

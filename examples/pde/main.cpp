@@ -1,9 +1,16 @@
+/* The library does not leak <mpi.h> through boltzmann.hpp, on purpose.  This
+ * example reduces its own counts across the ranks, so it includes it itself. */
+#include <mpi.h>
+
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <iterator>
+#include <string>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
-#include <iostream>
-#include <fstream>
 #include <memory>
 
 #include "../../boltzmann.hpp"
@@ -954,86 +961,287 @@ void price(
     Y.V=CN.Vprev[XP.N/2];
 }
 
-int N=2000; 
-int M=50;
+int N=40;
+int M=20;
 const double S0=70.0;
 const double r=0.07;
 const double K=40.0;
 const double T=1.0;
 
-int main( int argc , char* argv[] ) 
+/*
+ * THE BUILT-IN SCENARIO.  Byte for byte scenario_3.in, which is what this
+ * example ran with before: a local volatility surface as a ratio of two
+ * degree-14 polynomials in log-spot, a(x)/b(x), scaled by t.  It is embedded
+ * so that `./pde` with no arguments is a complete run -- the example used to
+ * exit 1 with "Please specify input scenario file", which made it useless to
+ * `make test` and invisible to `make ranks`.  A file named on the command
+ * line still wins, and the six scenario_*.in files are still there.
+ */
+static const char DEFAULT_SCENARIO[] =
+  "14 14\n"
+  /* a[0..14] */
+  "0.05\n"
+  "0\n"
+  "0.1375\n"
+  "0\n"
+  "0.135577\n"
+  "0\n"
+  "0.0639022\n"
+  "0\n"
+  "0.0154429\n"
+  "0\n"
+  "0.00184878\n"
+  "0\n"
+  "9.39685e-05\n"
+  "0\n"
+  "1.29428e-06\n"
+  /* b[0..14] */
+  "1\n"
+  "0\n"
+  "1.75\n"
+  "0\n"
+  "1.21154\n"
+  "0\n"
+  "0.420673\n"
+  "0\n"
+  "0.076486\n"
+  "0\n"
+  "0.00688374\n"
+  "0\n"
+  "0.000254953\n"
+  "0\n"
+  "2.27637e-06\n";
+
+/*
+ * One tape, one budget, one gradient.
+ *
+ * Called TWICE from main() with different byte budgets.  That is the check:
+ * the Jacobian of a program is a property of the program, not of how much
+ * memory the tape was allowed, so a run broken into a hundred partitions and
+ * a run broken into a handful must agree to rounding.  It is the only
+ * reference this example can have -- there is no closed form for a
+ * Crank-Nicholson price under a rational local-volatility surface -- but it
+ * is a real one, because the two runs eliminate DIFFERENT graphs: chunking
+ * changes which vertices survive a partition boundary and therefore the whole
+ * elimination order.
+ */
+static void run_one( const std::string & scen ,
+                     int Mv , int Nv , largeint budget ,
+                     std::vector<double> & g ,
+                     largeint & parts , largeint & total ,
+                     largeint & cost  , largeint & passes ,
+                     int & ranks )
 {
-   if(argc!=4) 
-   { 
-     cerr << "Please specify input scenario file, e.g. scenario_1.in\n"; 
-     return 1; 
-   }
+  istringstream in(scen);
 
-   cout.precision(15);
+  ACTIVE_INPUTS<active> X(S0,r,K,T,in);
+  PASSIVE_INPUTS        XP(Nv,Mv);
+  ACTIVE_OUTPUTS<active> Y;
 
-   ifstream vols(argv[1]); 
-    
-   if(vols.fail())
-   { 
-     cerr << "Cannot open scenario file '" << argv[1] << "'\n"; 
-     return 1;
-   }
- 
-   M = atoi(argv[2]);//M is varied
-   N = atoi(argv[3]); //N=2000
-  
-   ACTIVE_INPUTS<active> X(S0,r,K,T,vols); 
+  const unsigned int xmsz = 4+X.sigmaSq.a.size()+X.sigmaSq.b.size();
 
-   vols.close();
+  initialize( (largeint)xmsz , 1 , budget );
 
-   PASSIVE_INPUTS XP(N,M);
- 
-   ACTIVE_OUTPUTS<active> Y;
+  std::vector<active*> XM(xmsz);
+  XM[0]=&X.S0; XM[1]=&X.r; XM[2]=&X.K; XM[3]=&X.T;
 
-   std::cout << "m = " << X.sigmaSq.m << std::endl;
-   std::cout << "n = " << X.sigmaSq.n << std::endl;
+  for( unsigned int i=0 ; i<X.sigmaSq.a.size() ; i++ )
+    XM[i+4]=&X.sigmaSq.a[i];
 
-   unsigned int xmsz = 4+X.sigmaSq.a.size()+X.sigmaSq.b.size();
+  for( unsigned int i=0 ; i<X.sigmaSq.b.size() ; i++ )
+    XM[i+4+X.sigmaSq.a.size()]=&X.sigmaSq.b[i];
 
-   initialize(xmsz,1,221175912);//N=1000, M is varied
-   //initialize(xmsz,1,442143912);//N=2000,M is varied
+  for( unsigned int i=0 ; i<xmsz ; i++ ) independent(*XM[i]);
 
-   active **XM=new active*[xmsz];
+  active & YM = Y.V;
 
-   XM[0]=&X.S0; XM[1]=&X.r; XM[2]=&X.K; XM[3]=&X.T;
-   
-   for (unsigned int i=0;i<X.sigmaSq.a.size();i++)
-     XM[i+4]=&X.sigmaSq.a[i];
-   
-   for (unsigned int i=0;i<X.sigmaSq.b.size();i++)
-     XM[i+4+X.sigmaSq.a.size()]=&X.sigmaSq.b[i];
-   
-  for (unsigned int i=0;i<xmsz;i++) independent(*XM[i]);   
-
-  active & YM = Y.V;//dependent variable  
-
-  CrankNicholson<active> CN(X,XP);
-
-  while(checkpoint(XM,YM))
-  {
-    try
-    {
-        price(CN,X,XP,Y);
-    }catch(BreakException const & e)
-    {
-
-    }
-  }
+  /*
+   * CN IS CONSTRUCTED INSIDE THE PASS, AND THAT IS NOT A STYLE CHOICE.
+   *
+   * It used to be built once, outside the checkpoint loop, and that was safe
+   * only for as long as this example never chunked: with a 221 MB budget
+   * there was one partition, one pass, and no boundary to survive.  Give it a
+   * budget that chunks and it corrupts the heap -- AddressSanitizer reports a
+   * use-after-free in Vertex::kill(), reached from active::operator= inside
+   * price(), on memory released by the previous partition's elimination.
+   *
+   * The rule it breaks: an `active` that is not an independent must not live
+   * from one pass to the next.  checkpoint() restores the independents and
+   * starts a new tape; every other active is left holding a pointer into the
+   * graph that was just freed.  CN's Vprev, Vcurr and LHSj_* arrays are
+   * exactly that -- and worse, they are READ before they are written on a
+   * later pass, so the stale graph node is spliced into the new graph.  The
+   * same mistake in a program whose arrays happen to be fully overwritten
+   * does not crash; it silently returns the wrong derivative.
+   *
+   * Everything a pass needs, a pass builds.
+   */
+  passes = run_tape( &XM[0] , YM , [&]{
+    CrankNicholson<active> CN(X,XP);
+    price(CN,X,XP,Y);
+  });
 
   dependent(YM);
 
-  double ** A;
-  harvest(1,xmsz,A);
-	
-  finalize(); 
- 
-  delete [] XM;
-   
-  return 0;
+  /* The two-argument harvest, not the three-argument one: the old call went
+   * through the printing path and dumped the whole gradient plus an
+   * intmed_map size to the terminal, once per rank, whatever you wanted. */
+  Jacobian J = harvest( 1 , (largeint)xmsz );
+
+  g.assign(xmsz,0.0);
+  if(!J.empty()){
+    for( unsigned int i=0 ; i<xmsz ; i++ ) g[i] = J(0,i);
+  }
+
+  parts  = get_partitions();
+  total  = get_total_partitions();
+  cost   = get_cost();
+  ranks  = MPI_size();//while the tape is still open: it is a tape query
+
+  finalize();
 }
 
+int main( int argc , char* argv[] )
+{
+  /*
+   * Everything is optional now.  `./pde` runs the built-in scenario; a file
+   * name still overrides it, and "-" means "the built-in one" so that M, N
+   * and the budget can be given without naming a file.
+   *
+   *     ./pde                                  built-in, M=50, N=100
+   *     ./pde scenario_5.in 100 200            a file, bigger grid
+   *     ./pde - 50 100 40000                   built-in, tighter budget
+   */
+  const char *   file   = (argc>1 && std::string(argv[1])!="-") ? argv[1] : 0;
+  const int      Mv     = (argc>2) ? atoi(argv[2]) : 20;
+  const int      Nv     = (argc>3) ? atoi(argv[3]) : 40;
+  const largeint budget = (argc>4) ? (largeint)atol(argv[4]) : 300000;
+
+  if( Mv<1 || Nv<4 ){ cerr << "pde: need M>=1 and N>=4\n"; return 1; }
+
+  M = Mv;
+  N = Nv;
+
+  std::string scen;
+
+  if(file){
+    ifstream f(file);
+    if(f.fail()){ cerr << "pde: cannot open scenario file '" << file << "'\n"; return 1; }
+    scen.assign( istreambuf_iterator<char>(f) , istreambuf_iterator<char>() );
+  }else{
+    scen = DEFAULT_SCENARIO;
+  }
+
+  /* ---- the run under test: chunked ------------------------------------ */
+
+  std::vector<double> gc;
+  largeint parts=0, total=0, cost=0, passes=0;
+  int      lib_ranks=0;
+  run_one( scen , Mv , Nv , budget , gc , parts , total , cost , passes , lib_ranks );
+
+  /* ---- the same program, told it has far more memory ------------------ */
+
+  std::vector<double> gs;
+  largeint sparts=0, stotal=0, scost=0, spasses=0;
+  int      sranks=0;
+  run_one( scen , Mv , Nv , budget*64 , gs , sparts , stotal , scost , spasses , sranks );
+
+  /* ---- gather --------------------------------------------------------- */
+
+  int rank=0, size=1;
+  MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+  MPI_Comm_size(MPI_COMM_WORLD,&size);
+
+  const int nin = (int)gc.size();
+
+  std::vector<double> g(nin,0.0), gref(nin,0.0);
+  MPI_Allreduce(&gc[0],&g[0]   ,nin,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);//one contributor
+  MPI_Allreduce(&gs[0],&gref[0],nin,MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+
+  long lp=(long)parts, total_parts=0, min_parts=0, max_parts=0, ranks_working=0;
+  long one = (parts>0) ? 1 : 0;
+  MPI_Allreduce(&lp ,&total_parts  ,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
+  MPI_Allreduce(&lp ,&min_parts    ,1,MPI_LONG,MPI_MIN,MPI_COMM_WORLD);
+  MPI_Allreduce(&lp ,&max_parts    ,1,MPI_LONG,MPI_MAX,MPI_COMM_WORLD);
+  MPI_Allreduce(&one,&ranks_working,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
+
+  long lc=(long)cost, total_cost=0;
+  MPI_Allreduce(&lc,&total_cost,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
+
+  long ls=(long)sparts, few_parts=0;
+  MPI_Allreduce(&ls,&few_parts,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
+
+  /* ---- the check ------------------------------------------------------ */
+
+  double scale=0.0, worst=0.0;
+  int    where=0;
+  for( int i=0 ; i<nin ; i++ ) if(fabs(gref[i])>scale) scale=fabs(gref[i]);
+  for( int i=0 ; i<nin ; i++ ){
+    const double d = fabs(g[i]-gref[i]);
+    if(d>worst){ worst=d; where=i; }
+  }
+  const double rel = (scale>0.0) ? worst/scale : worst;
+
+  /* Two eliminations of two different graphs reaching the same numbers: the
+   * difference is accumulated rounding, not method error.  1e-10 is five
+   * orders above what is observed. */
+  const double TOL = 1.0e-10;
+
+  int bad = 0;
+
+  if( !(rel<=TOL) ){
+    bad++;
+    if(!rank) printf("  FAIL chunked vs unchunked: %.3e relative at input %d, tol %.1e\n",
+                     rel,where,TOL);
+  }
+  if( total != (largeint)total_parts ){
+    bad++;
+    if(!rank) printf("  FAIL library reports %lu partitions, the ranks recorded %ld\n",
+                     (unsigned long)total,total_parts);
+  }
+  if( lib_ranks != size ){
+    bad++;
+    if(!rank) printf("  FAIL library reports %d ranks, MPI reports %d\n",lib_ranks,size);
+  }
+  if( total_parts < 8 ){
+    bad++;
+    if(!rank) printf("  FAIL only %ld partitions -- the tape is not being chunked.  "
+                     "Lower the budget or raise M.\n",total_parts);
+  }
+  if( total_parts <= few_parts ){
+    bad++;
+    if(!rank) printf("  FAIL the two budgets gave %ld and %ld partitions -- "
+                     "the comparison is not comparing anything.\n",total_parts,few_parts);
+  }
+  if( size>1 && ranks_working<2 ){
+    bad++;
+    if(!rank) printf("  FAIL %ld partitions all landed on one rank of %d -- "
+                     "the pipeline is not being exercised.\n",total_parts,size);
+  }
+  if( passes != parts+1 ){
+    bad++;
+    if(!rank) printf("  FAIL rank %d ran %lu passes for %lu partitions\n",
+                     rank,(unsigned long)passes,(unsigned long)parts);
+  }
+
+  /* ---- report --------------------------------------------------------- */
+
+  if(!rank){
+    printf("pde: %lu partitions over %d MPI rank%s\n",
+           (unsigned long)total,lib_ranks,(lib_ranks==1)?"":"s");
+    printf("  problem      Crank-Nicholson, M=%d time steps, N=%d log-spot nodes, %s\n",
+           Mv,Nv,file?file:"built-in scenario");
+    printf("  gradient     1 x %d (S0, r, K, T and %d surface coefficients)\n",nin,nin-4);
+    printf("  partitions   %ld recorded in total, %ld..%ld per rank, "
+           "%ld of %d ranks working\n",
+           total_parts,min_parts,max_parts,ranks_working,size);
+    printf("  elim cost    %ld total\n",total_cost);
+    printf("  budget %lu vs %lu bytes: %ld partitions vs %ld, gradients agree to %.3e  (tol %.1e)\n",
+           (unsigned long)budget,(unsigned long)(budget*64),total_parts,few_parts,rel,TOL);
+    printf("  dV/dS0 = %.12e   dV/dr = %.12e\n",g[0],g[1]);
+    printf("  dV/dK  = %.12e   dV/dT = %.12e\n",g[2],g[3]);
+    printf("pde: %s\n",(bad==0)?"PASS":"FAIL");
+  }
+
+  return (bad==0) ? 0 : 1;
+}

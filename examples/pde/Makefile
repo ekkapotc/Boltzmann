@@ -1,2 +1,2 @@
-RUNARGS = scenario_3.in 50 100
+RUNARGS = - 20 40 300000
 include ../common.mk

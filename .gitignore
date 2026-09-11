@@ -28,3 +28,6 @@ Makefile.new
 INSTALL-MAKEFILES.txt
 paa_fixes.diff
 Claude outputs/
+
+# text
+*.txt

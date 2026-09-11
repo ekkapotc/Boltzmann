@@ -1,0 +1,169 @@
+#
+# A pipelined-parallel automatic differentiation library: Jacobians by sparse
+# graph vertex elimination, with the tape partitioned across MPI ranks.
+#
+#   inc/         headers.  The public surface is boltzmann.hpp, which pulls in
+#                Typedefs, Active, Jacobian, API and BreakException.  Vertex,
+#                Edge, Process and the two arenas are internals and are
+#                deliberately not reachable from it -- nor is <mpi.h>.
+#   src/         the library.  Six translation units, built by src/Makefile
+#                into build/lib/libboltzmann.a.
+#   examples/    one directory per example: a main.cpp and a Makefile of one
+#                to four lines that includes ../common.mk.  examples/Makefile
+#                discovers them from the filesystem -- there is no list to
+#                edit when one is added or removed.  A directory containing
+#                a file called SKIP is passed over.
+#   build/       everything generated.  Nothing is written into the source
+#                tree, and `make clean` is `rm -rf build`.
+#   backup_20260911/
+#                six examples that predate the checkpointing protocol and no
+#                longer compile, frozen with their own README.  Not built,
+#                not discovered, kept for the record -- as Maxwell keeps its
+#                own pre-checkpoint examples.
+#
+# Targets
+#   make            the library and every example
+#   make test       build, then run the whole suite at NP ranks
+#   make list       every example discovered, with the arguments it runs with
+#   make ranks      run the assertion suites at 1, 2, 3 and 4 ranks.  THE
+#                   IMPORTANT ONE: the Jacobian must not depend on how many
+#                   ranks computed it, and nothing else in the suite checks
+#                   that, because every other target runs at one NP.
+#   make sanitize   rebuild under AddressSanitizer in a SEPARATE tree and run
+#                   the assertion suites
+#   make clean      remove build/
+#
+# Ported from Maxwell's build tree, with one addition: NP.  Every example is
+# launched through $(MPIRUN) $(MPIRUN_FLAGS) -np $(NP), so the whole suite can
+# be moved to a different rank count from the command line -- make test NP=8.
+#
+BUILD_DIR := $(CURDIR)/build
+export BUILD_DIR
+
+# make PREDEFINES CXX as "g++", so "CXX ?= mpic++" silently does nothing --
+# ?= only fires when the variable is undefined, and a built-in default counts
+# as defined.  This is the same trap Maxwell hit with CC.  Override the
+# built-in default only, so `make CXX=mpiicpc` and an exported CXX both win.
+ifeq ($(origin CXX),default)
+CXX := mpic++
+endif
+MPIRUN    ?= mpirun
+NP        ?= 2
+
+# ------------------------------------------------------- oversubscribing ---
+#
+# Open MPI (and the PRRTE runtime behind Open MPI 5) refuses -np larger than
+# the number of cores it can see, and dies with
+#
+#     There are not enough slots available in the system to satisfy the N
+#     slots that were requested by the application
+#
+# -- which on Debian and Ubuntu often prints instead as "Sorry! ... I couldn't
+# open the help file ... help-prte-rmaps-base.txt", because those packages ship
+# the runtime without its message catalogue.  That second message is a
+# packaging gap, not a fault in the program being launched; the real complaint
+# is the slot count.  --oversubscribe lifts the rule.
+#
+# MPICH's Hydra has no such rule and rejects the flag, so this cannot simply be
+# hard-coded.  Ask mpirun which it is, once, and pass the flag only where it
+# exists.  Set MPIRUN_FLAGS on the command line to override the guess, or to
+# empty to disable it:  make ranks MPIRUN_FLAGS=
+#
+# Oversubscribing is for testing the rank-count invariant, not for measuring
+# anything.  Ranks in this library block in MPI_Probe waiting for the hop
+# upstream, and a blocked rank sharing a core with a working one is a rank the
+# scheduler keeps waking for nothing.  Expect it to be slow, and do not read a
+# timing off it.
+#
+MPIRUN_FLAGS ?= $(shell $(MPIRUN) --version 2>&1 | grep -qi 'open[ -]*mpi' && echo --oversubscribe)
+
+export CXX MPIRUN MPIRUN_FLAGS NP
+
+STD       ?= -std=gnu++0x
+WARN      ?= -Wall -Wextra
+LIB_FLAGS ?= -g $(STD) $(WARN)
+
+.PHONY: all lib examples test list ranks sanitize clean help
+
+all: examples
+
+lib:
+	@$(MAKE) --no-print-directory -C src FLAGS="$(LIB_FLAGS)"
+
+examples: lib
+	@$(MAKE) --no-print-directory -C examples all
+
+test: all
+	@$(MAKE) --no-print-directory -C examples test
+
+list:
+	@$(MAKE) --no-print-directory -C examples list
+
+# --------------------------------------------------------------- ranks ----
+#
+# The invariant that only a parallel library has: the Jacobian a program
+# computes must not depend on the number of ranks that computed it, or on the
+# memory budget, or on the two together.  `make test` runs at one NP and
+# cannot see a violation; this runs the assertion suites across four.
+#
+# lorenz is the one that makes this target mean something: it breaks a
+# 2000-step integration into ~150 partitions and asserts that more than one
+# rank recorded some of them, so at np>1 it is a statement about the
+# pipeline rather than about a tape that happened to fit.
+#
+# More ranks than cores is fine and is worth doing -- a partition count that
+# does not divide the rank count exercises the ring's tail -- but see
+# MPIRUN_FLAGS above before raising this past nproc:
+#
+#     make ranks RANK_COUNTS="1 2 3 4 5 7 8"
+#
+RANK_EXAMPLES ?= invariants fdcheck regress lorenz heat pde
+RANK_COUNTS   ?= 1 2 3 4
+
+ranks: all
+	@for np in $(RANK_COUNTS); do \
+	  for d in $(RANK_EXAMPLES); do \
+	    echo "=================================================== $$d  (np=$$np)"; \
+	    $(MAKE) --no-print-directory -C examples/$$d run NP=$$np || exit 1; \
+	  done; \
+	done
+	@echo "=================================================== identical at $(RANK_COUNTS) ranks"
+
+# ------------------------------------------------------------ sanitize ----
+#
+# A separate BUILD_DIR rather than a flags stamp: make compares timestamps
+# only, so sanitizing into build/ leaves every binary newer than its source
+# and a following plain `make` rebuilds nothing -- you keep running
+# instrumented code without being told.
+#
+SAN_FLAGS    ?= -fsanitize=address -fno-omit-frame-pointer
+SAN_BUILD    ?= $(CURDIR)/build-asan
+SAN_EXAMPLES ?= invariants regress fdcheck lorenz heat pde
+
+sanitize:
+	@$(MAKE) --no-print-directory -C src \
+	    BUILD_DIR="$(SAN_BUILD)" \
+	    FLAGS="-g $(STD) $(WARN) -O1 $(SAN_FLAGS)"
+	@for d in $(SAN_EXAMPLES); do \
+	  $(MAKE) --no-print-directory -C examples/$$d all \
+	      BUILD_DIR="$(SAN_BUILD)" \
+	      BASE_FLAGS="-g $(STD) $(WARN) -O1 $(SAN_FLAGS)" || exit 1; \
+	done
+	@for d in $(SAN_EXAMPLES); do \
+	  echo "=================================================== $$d (asan)"; \
+	  $(MAKE) --no-print-directory -C examples/$$d run BUILD_DIR="$(SAN_BUILD)" || exit 1; \
+	done
+	@echo "=================================================== sanitizer clean"
+
+clean:
+	@$(MAKE) --no-print-directory -C examples clean
+	@rm -rf $(BUILD_DIR) $(SAN_BUILD)
+
+help:
+	@echo "make            build build/lib/libboltzmann.a and every example into build/bin"
+	@echo "make test       build, then run the whole suite at NP=$(NP) ranks"
+	@echo "make ranks      run the assertion suites at $(RANK_COUNTS) ranks"
+	@echo "                more ranks than cores: make ranks RANK_COUNTS=\"1 2 4 8\""
+	@echo "make list       list the examples and the arguments they run with"
+	@echo "make sanitize   rebuild into build-asan/ under ASan and run: $(SAN_EXAMPLES)"
+	@echo "make clean      remove build/ and build-asan/"

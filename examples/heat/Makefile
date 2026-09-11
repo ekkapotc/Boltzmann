@@ -1,2 +1,2 @@
-RUNARGS = 20 40 200000 50
+RUNARGS = 40 400 150000
 include ../common.mk
