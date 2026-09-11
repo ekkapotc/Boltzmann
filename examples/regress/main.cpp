@@ -545,6 +545,41 @@ static void m08_stale_active()
      r_in==0 && r_out>0);
 }
 
+
+/* M-09  harvest(double**&) leaves the caller's pointer NULL on every rank
+ *       that did not assemble.  free_jacobian()'s comment has always claimed
+ *       this -- "tolerates A==NULL, which is what every rank other than the
+ *       assembling one has" -- but A was only ever written inside the
+ *       is_final_rank() branch, so elsewhere it kept whatever the caller had
+ *       declared.  Every legacy example declares it `double ** A;`.
+ */
+static void m09_harvest_null_off_rank()
+{
+  initialize(1,1,100000);
+
+  active x; x = 0.7; independent(x);
+  active y;
+
+  run_tape( &x , y , [&]{ active u=x; for(int i=0;i<6;i++) u = sin(u)+0.5*u; y = u; });
+
+  dependent(y);
+
+  double ** A = (double**)0xDEADBEEF;//poison: a NULL here has to be written, not inherited
+  harvest(1,1,A,false);
+
+  const bool assembling = is_harvesting_rank();
+
+  ok("M-09 harvest gives the assembling rank a matrix",
+     !assembling || A!=NULL);
+  ok("M-09 harvest NULLs the pointer on every other rank",
+     assembling || A==NULL);
+
+  free_jacobian(1,A);
+  ok("M-09 free_jacobian is then safe on every rank", A==NULL);
+
+  finalize();
+}
+
 int main( int argc , char ** argv )
 {
   (void)argc; (void)argv;
@@ -565,6 +600,7 @@ int main( int argc , char ** argv )
   m06_tape_independence();
   m07_total_partitions();
   m08_stale_active();
+  m09_harvest_null_off_rank();
 
   misuse_no_tape();//and again after every tape has been closed
 

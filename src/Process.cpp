@@ -1,6 +1,7 @@
 #include "../inc/Process.hpp"
 #include "../inc/API.hpp"
 #include "../inc/BreakException.hpp"
+#include "../inc/MpiCheck.hpp"
 
 #include <cassert>
 #include <cstdio>
@@ -128,7 +129,7 @@ Process::~Process()
   destroy_graph();
 
   if(MPI_EDGE!=MPI_DATATYPE_NULL){
-    MPI_Type_free(&MPI_EDGE);//released before MPI_Finalize()
+    BZ_MPI( MPI_Type_free(&MPI_EDGE) );//released before MPI_Finalize()
     MPI_EDGE = MPI_DATATYPE_NULL;
   }
 }
@@ -561,7 +562,7 @@ void Process::local_vertex_elimination_normal( std::vector<Vertex*> & from , std
  
     if((pos%probe_freq)==0)
     {
-      MPI_Iprobe( mpi_src_rank ,MPI_COMM_DATA_MESSAGE , comm , &ready , &status );
+      BZ_MPI( MPI_Iprobe( mpi_src_rank ,MPI_COMM_DATA_MESSAGE , comm , &ready , &status ) );
     
       if(ready){
         break;
@@ -570,10 +571,10 @@ void Process::local_vertex_elimination_normal( std::vector<Vertex*> & from , std
   }
 
   if(!ready){
-     MPI_Probe( mpi_src_rank , MPI_COMM_DATA_MESSAGE , comm , &status );
+     BZ_MPI( MPI_Probe( mpi_src_rank , MPI_COMM_DATA_MESSAGE , comm , &status ) );
   }
 
-  MPI_Get_count( &status , MPI_EDGE , &cji_count );
+  BZ_MPI( MPI_Get_count( &status , MPI_EDGE , &cji_count ) );
 
   if(cji_count<0){
     cji_count = 0;
@@ -582,7 +583,7 @@ void Process::local_vertex_elimination_normal( std::vector<Vertex*> & from , std
   mid.resize(cji_count);//resize mid to accomodate incoming message
 
   //&mid.front() is undefined on an empty vector
-  MPI_Recv( cji_count?&(mid.front()):NULL , cji_count , MPI_EDGE , mpi_src_rank , MPI_COMM_DATA_MESSAGE , comm , &status );
+  BZ_MPI( MPI_Recv( cji_count?&(mid.front()):NULL , cji_count , MPI_EDGE , mpi_src_rank , MPI_COMM_DATA_MESSAGE , comm , &status ) );
 
   //std::cout << "Rank " << mpi_rank << " received " << cji_count-1 << " edges from Rank " << mpi_src_rank << std::endl;
 
@@ -684,7 +685,7 @@ void Process::send( std::vector<Vertex*> & from , std::vector<cji_t> & to )
   from.clear();
 
   int mpi_dst_rank = (mpi_rank+mpi_size-1)%mpi_size;
-  MPI_Send( to.empty()?NULL:&(to.front()) , (int)to.size() , MPI_EDGE , mpi_dst_rank , MPI_COMM_DATA_MESSAGE , comm );
+  BZ_MPI( MPI_Send( to.empty()?NULL:&(to.front()) , (int)to.size() , MPI_EDGE , mpi_dst_rank , MPI_COMM_DATA_MESSAGE , comm ) );
 
   //std::cout << "Rank " << mpi_rank << " sent " << to.size()-1 << " edges to Rank " << mpi_dst_rank << std::endl;
 
@@ -926,8 +927,8 @@ void Process::retire( Vertex * v )
 
 void Process::initialize_mpi_env()
 {
-  MPI_Comm_rank( comm , &mpi_rank );
-  MPI_Comm_size( comm , &mpi_size );
+  BZ_MPI( MPI_Comm_rank( comm , &mpi_rank ) );
+  BZ_MPI( MPI_Comm_size( comm , &mpi_size ) );
 
   struct cji_t e(0,0,0.0);//dummy element
   
@@ -935,12 +936,12 @@ void Process::initialize_mpi_env()
 
   MPI_Aint offsets[3];
   MPI_Aint base_addr, addr;
-  MPI_Get_address(&e,&base_addr);	
-  MPI_Get_address(&e.src,&addr);
+  BZ_MPI( MPI_Get_address(&e,&base_addr) );	
+  BZ_MPI( MPI_Get_address(&e.src,&addr) );
   offsets[0] = addr - base_addr;
-  MPI_Get_address(&e.tgt,&addr);
+  BZ_MPI( MPI_Get_address(&e.tgt,&addr) );
   offsets[1] = addr - base_addr;
-  MPI_Get_address(&e.cji,&addr);
+  BZ_MPI( MPI_Get_address(&e.cji,&addr) );
   offsets[2] = addr - base_addr; 
 
   /*
@@ -962,10 +963,10 @@ void Process::initialize_mpi_env()
    * impossible rather than unlikely.
    */
   MPI_Datatype packed;
-  MPI_Type_create_struct(3,lengths,offsets,types,&packed);
-  MPI_Type_create_resized(packed,0,(MPI_Aint)sizeof(cji_t),&MPI_EDGE);
-  MPI_Type_free(&packed);
-  MPI_Type_commit(&MPI_EDGE);
+  BZ_MPI( MPI_Type_create_struct(3,lengths,offsets,types,&packed) );
+  BZ_MPI( MPI_Type_create_resized(packed,0,(MPI_Aint)sizeof(cji_t),&MPI_EDGE) );
+  BZ_MPI( MPI_Type_free(&packed) );
+  BZ_MPI( MPI_Type_commit(&MPI_EDGE) );
 }
 
 void Process::initialize( largeint indep_count , largeint dep_count , largeint mem_size , MPI_Comm comm )
@@ -1356,6 +1357,20 @@ void Process::destructor( const active & x )//to be made inline
 
 void Process::harvest( largeint nrows , largeint ncols ,  double **& A , bool print_out )//default : print_out = true
 {
+  /*
+   * free_jacobian() has always documented that it "tolerates A==NULL, which
+   * is what every rank other than the assembling one has".  That was not
+   * true: A was written only inside the is_final_rank() branch, so on every
+   * other rank the caller's pointer was left exactly as declared -- and the
+   * examples declare it `double ** A;`.  free_jacobian() then read an
+   * indeterminate pointer, found it non-null often enough, and deleted it.
+   *
+   * One assignment makes the documented contract the real one.  NULL rather
+   * than a zeroed matrix on purpose: it costs nothing, it matches
+   * Jacobian::empty(), and it keeps "who assembled this" answerable.
+   */
+  A = NULL;
+
   if(!profiling)
   {
     if(is_final_rank())

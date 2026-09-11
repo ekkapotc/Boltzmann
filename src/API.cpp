@@ -3,6 +3,7 @@
 #include "../inc/Edge.hpp"
 #include "../inc/Process.hpp"
 #include "../inc/TapeState.hpp"
+#include "../inc/MpiCheck.hpp"
 #include "../inc/BreakException.hpp"
 
 #include <mpi.h>
@@ -84,7 +85,17 @@ dep_shadow_copy(new double[size_t(m?m:1)])
    * freed it out from under the first tape.
    */
   MPI_Comm dup = MPI_COMM_NULL;
-  MPI_Comm_dup(MPI_COMM_WORLD,&dup);
+  BZ_MPI( MPI_Comm_dup(MPI_COMM_WORLD,&dup) );
+
+  /*
+   * Hand errors back instead of aborting from inside the call.  Without this,
+   * every BZ_MPI() in the library is dead code: the default handler is
+   * MPI_ERRORS_ARE_FATAL and the return value never carries a failure.  Set
+   * on our own duplicate only -- MPI_COMM_WORLD belongs to the caller, and a
+   * library has no business changing how the caller's own communications
+   * fail.
+   */
+  BZ_MPI( MPI_Comm_set_errhandler(dup,MPI_ERRORS_RETURN) );
 
   proc.initialize(n,m,mem,dup);
 }
@@ -95,7 +106,7 @@ TapeState::~TapeState()
   delete [] dep_shadow_copy;
 
   if(proc.comm!=MPI_COMM_NULL){
-    MPI_Comm_free(&proc.comm);//one per tape; this used to leak one per call
+    BZ_MPI( MPI_Comm_free(&proc.comm) );//one per tape; this used to leak one per call
     proc.comm = MPI_COMM_NULL;
   }
 }
@@ -133,10 +144,10 @@ namespace boltzmann//process-wide, and correctly so: MPI's lifecycle is not a ta
   static void boltzmann_mpi_shutdown()
   {
     int done = 0;
-    MPI_Finalized(&done);
+    BZ_MPI( MPI_Finalized(&done) );
 
     if(!done && mpi_started_by_boltzmann){
-      MPI_Finalize();
+      BZ_MPI( MPI_Finalize() );
     }
   }
 
@@ -144,10 +155,10 @@ namespace boltzmann//process-wide, and correctly so: MPI's lifecycle is not a ta
   static void ensure_mpi()
   {
     int up = 0;
-    MPI_Initialized(&up);
+    BZ_MPI( MPI_Initialized(&up) );
 
     if(!up){
-      MPI_Init(NULL,NULL);
+      BZ_MPI( MPI_Init(NULL,NULL) );
       mpi_started_by_boltzmann = true;
     }
 
@@ -216,6 +227,26 @@ void boltzmann::finalize()
   }
 
   tp->proc.finalize();
+
+  /*
+   * THE LAST CHANCE TO SAY THE JACOBIAN IS WRONG.
+   *
+   * get_stale_reads() has been readable since the checkpoint contract was
+   * enforced, but only a test ever looked.  A nonzero count means the section
+   * read an active that did not survive a pass, so a derivative flowed
+   * through a constant and the answer that just came out of harvest() is
+   * wrong.  That is not something to leave to whoever remembers to ask, and
+   * the tape is about to be deleted, so this is the last moment it can be
+   * said at all.  The per-read message is printed once; this is printed once
+   * per tape, with the total.
+   */
+  const largeint stale = tp->proc.get_stale_reads();
+
+  if(stale){
+    std::cerr << "boltzmann::finalize: this tape completed with " << stale
+              << " read(s) of an active that did not survive checkpoint().\n"
+              << "                     The Jacobian it produced is WRONG.\n";
+  }
 
   /*
    * NOT MPI_Finalize().  See ensure_mpi() above: the runtime goes down at
@@ -430,153 +461,119 @@ void boltzmann::set_output_array_dimension( largeint rows , largeint cols )
   tp->dep_cols = cols;
 }
 
-bool boltzmann::checkpoint( active * x , active & y )
+/* ----------------------------------------------------- the checkpoint loop --
+ *
+ * ONE IMPLEMENTATION, FOUR SIGNATURES.
+ *
+ * These four overloads were four copies of the same forty lines, differing
+ * only in how the dependents are walked.  That is where SVEGP-17 lived: the
+ * 2-D form indexed the shadow copy with the wrong dimension, and because no
+ * other copy had a 2-D index there was nothing for it to disagree with.  The
+ * shape-specific part is now three tiny helpers, each written once, and the
+ * protocol is written once.
+ *
+ * The order inside is not free to change.  The dependents are saved before
+ * finalize() because finalize() is what settles the partition count, and they
+ * are restored after terminate() says the loop is over -- the caller gets its
+ * dependent back with the idx it had when the tape closed, which is what the
+ * Jacobian is harvested against.
+ */
+namespace
 {
-  TapeState * tp = current_tape();
+  using namespace boltzmann;
+  using boltzmann::internals::TapeState;
 
-  /*
-   * Maxwell SVEGP-26 : with no tape open this used to return true on the
-   * first call -- tp->run_counter was 0 -- run the caller's section with nothing
-   * recording, and then dereference a null tape on the second.  End the
-   * loop before it starts instead.
-   */
-  if(!tp){
-    std::cerr << "boltzmann::checkpoint: no tape is open -- call initialize() first.\n";
-    return false;
+  /* Save each dependent's value and index into the tape's shadow copy, and
+   * tell the Process which vertex index the dependent sits on. */
+  inline void save_dependents( TapeState * tp , active & y )
+  {
+    y.old_idx = y.idx;
+    tp->dep_shadow_copy[0] = y.val;
+    tp->proc.save_dependent_index(y.idx);
   }
 
-  if(!tp->run_counter){
-    tp->run_counter++;
-    return true;
-  }else{
-
-    if(tp->run_counter==1){
-      y.old_idx = y.idx;
-      tp->dep_shadow_copy[0] = y.val;
-
-      tp->proc.save_dependent_index(y.idx);
-      tp->proc.finalize();//top_owner_idx has been determined
-      tp->proc.disable_profiling();//switch off profiling
-      /*
-       * This used to print unconditionally, from inside checkpoint(), on
-       * every rank -- so a p-rank job printed it p times, in the middle of
-       * whatever the caller was doing, and an optimiser calling the library
-       * in a loop printed it once per iteration per rank.  boltzmann::
-       * get_partitions() is the way to ask (Maxwell SVEGP-22); a library
-       * does not narrate.
-       */
-    }else if(tp->run_counter==2){  
-      tp->proc.max_rank_check_memory(); 
+  inline void save_dependents( TapeState * tp , active * y )
+  {
+    for( largeint k=0 ; k<tp->dependent_size ; k++ ){
+      y[k].old_idx = y[k].idx;
+      tp->dep_shadow_copy[k] = y[k].val;
+      tp->proc.save_dependent_index(y[k].idx);
     }
-
-    //internals::skip_mode = false;
-    internals::restore_values(x,y);
-   
-    tp->proc.reinitialize();
- 
-    if(!(tp->proc.terminate()))
-    {
-      tp->run_counter++;
-      return true;
-    }else
-    {
-      y.idx = y.old_idx;
-      y.val = tp->dep_shadow_copy[0];
-      //std::cout << "y.idx = " << y.idx << std::endl;
-      tp->proc.ignore_vertices();//make destructor ignore checking vertex
-      return false;
-    }    
-  }
-}
-
-bool boltzmann::checkpoint( active ** x , active & y )
-{
-  TapeState * tp = current_tape();
-
-  /*
-   * Maxwell SVEGP-26 : with no tape open this used to return true on the
-   * first call -- tp->run_counter was 0 -- run the caller's section with nothing
-   * recording, and then dereference a null tape on the second.  End the
-   * loop before it starts instead.
-   */
-  if(!tp){
-    std::cerr << "boltzmann::checkpoint: no tape is open -- call initialize() first.\n";
-    return false;
   }
 
-  if(!tp->run_counter){
-    tp->run_counter++;
-    return true;
-  }else{
-
-    if(tp->run_counter==1){
-      y.old_idx = y.idx;
-      tp->dep_shadow_copy[0] = y.val;
-
-      tp->proc.save_dependent_index(y.idx);
-      tp->proc.finalize();//top_owner_idx has been determined
-      tp->proc.disable_profiling();//switch off profiling
-      /*
-       * This used to print unconditionally, from inside checkpoint(), on
-       * every rank -- so a p-rank job printed it p times, in the middle of
-       * whatever the caller was doing, and an optimiser calling the library
-       * in a loop printed it once per iteration per rank.  boltzmann::
-       * get_partitions() is the way to ask (Maxwell SVEGP-22); a library
-       * does not narrate.
-       */
-    }else if(tp->run_counter==2){  
-      tp->proc.max_rank_check_memory(); 
-    }
-
-    //internals::skip_mode = false;
-    internals::restore_values(x,y);
-   
-    tp->proc.reinitialize();
- 
-    if(!(tp->proc.terminate()))
-    {
-      tp->run_counter++;
-      return true;
-    }else
-    {
-      y.idx = y.old_idx;
-      y.val = tp->dep_shadow_copy[0];
-      //std::cout << "y.idx = " << y.idx << std::endl;
-      tp->proc.ignore_vertices();//make destructor ignore checking vertex
-      return false;
-    }    
-  }
-}
-
-bool boltzmann::checkpoint( active * x , active * y )
-{
-  TapeState * tp = current_tape();
-
-  /*
-   * Maxwell SVEGP-26 : with no tape open this used to return true on the
-   * first call -- tp->run_counter was 0 -- run the caller's section with nothing
-   * recording, and then dereference a null tape on the second.  End the
-   * loop before it starts instead.
-   */
-  if(!tp){
-    std::cerr << "boltzmann::checkpoint: no tape is open -- call initialize() first.\n";
-    return false;
-  }
-
-  if(!tp->run_counter){
-    tp->run_counter++;
-    return true;
-  }else{
-
-    if(tp->run_counter==1){
-      for( largeint k=0 ; k<tp->dependent_size ; k++ ){
-        y[k].old_idx = y[k].idx;
-        tp->dep_shadow_copy[k] = y[k].val;
-        //std::cout << y[k].idx << std::endl;
-        tp->proc.save_dependent_index(y[k].idx);
+  inline void save_dependents( TapeState * tp , active ** y )
+  {
+    for( largeint i=0 ; i<tp->dep_rows ; i++ ){
+      for( largeint j=0 ; j<tp->dep_cols ; j++ ){
+        y[i][j].old_idx = y[i][j].idx;
+        tp->dep_shadow_copy[tp->dep_cols*i+j] = y[i][j].val;
+        tp->proc.save_dependent_index(y[i][j].idx);
       }
-   
-      tp->proc.finalize(); 
+    }
+  }
+
+  /* Put them back as the loop ends.  The stride here and the stride above are
+   * now adjacent and obviously the same expression; they were forty lines and
+   * one function apart. */
+  inline void restore_dependents( TapeState * tp , active & y )
+  {
+    y.idx = y.old_idx;
+    y.val = tp->dep_shadow_copy[0];
+  }
+
+  inline void restore_dependents( TapeState * tp , active * y )
+  {
+    for( largeint k=0 ; k<tp->dependent_size ; k++ ){
+      y[k].idx = y[k].old_idx;
+      y[k].val = tp->dep_shadow_copy[k];
+    }
+  }
+
+  inline void restore_dependents( TapeState * tp , active ** y )
+  {
+    for( largeint i=0 ; i<tp->dep_rows ; i++ ){
+      for( largeint j=0 ; j<tp->dep_cols ; j++ ){
+        y[i][j].idx = y[i][j].old_idx;
+        y[i][j].val = tp->dep_shadow_copy[tp->dep_cols*i+j];
+      }
+    }
+  }
+
+  /*
+   * Y BY REFERENCE, NOT BY VALUE, AND THE SUITE SAID SO IMMEDIATELY.
+   *
+   * Written as `Y y` first.  For the scalar overload Y deduces to `active`,
+   * so the dependent was COPIED -- the protocol then saved and restored the
+   * copy while the caller's y went untouched, and copying an active records
+   * an operation on the tape as a side effect.  Every derivative came out
+   * 0.0: fdcheck 36 failures, regress 45.  `Y & y` deduces active& for the
+   * scalar, active*& and active**& for the array forms, which is what the
+   * four hand-written bodies had.
+   */
+  template<class X, class Y>
+  bool checkpoint_impl( X x , Y & y )
+  {
+    TapeState * tp = current_tape();
+
+    /*
+     * Maxwell SVEGP-26 : with no tape open this used to return true on the
+     * first call -- tp->run_counter was 0 -- run the caller's section with
+     * nothing recording, and then dereference a null tape on the second.  End
+     * the loop before it starts instead.
+     */
+    if(!tp){
+      std::cerr << "boltzmann::checkpoint: no tape is open -- call initialize() first.\n";
+      return false;
+    }
+
+    if(!tp->run_counter){
+      tp->run_counter++;
+      return true;
+    }
+
+    if(tp->run_counter==1){
+      save_dependents(tp,y);
+      tp->proc.finalize();//top_owner_idx has been determined
       tp->proc.disable_profiling();
       /*
        * This used to print unconditionally, from inside checkpoint(), on
@@ -587,99 +584,42 @@ bool boltzmann::checkpoint( active * x , active * y )
        * does not narrate.
        */
     }else if(tp->run_counter==2){
-       tp->proc.max_rank_check_memory();
+      tp->proc.max_rank_check_memory();
     }
 
-    //internals::skip_mode = false;
     internals::restore_values(x,y);
 
     tp->proc.reinitialize();
 
-    if(!(tp->proc.terminate()))
-    {
+    if(!(tp->proc.terminate())){
       tp->run_counter++;
-      return true; 
-    }else
-    {
-      for( largeint k=0 ; k<tp->dependent_size ; k++ ){
-        y[k].idx = y[k].old_idx;
-        y[k].val = tp->dep_shadow_copy[k];
-      }
-
-      tp->proc.ignore_vertices();//make destructor ignore checking vertex
-      return false;
+      return true;
     }
+
+    restore_dependents(tp,y);
+    tp->proc.ignore_vertices();//make the destructor skip its vertex check
+    return false;
   }
+}
+
+bool boltzmann::checkpoint( active * x , active & y )
+{
+  return checkpoint_impl(x,y);
+}
+
+bool boltzmann::checkpoint( active ** x , active & y )
+{
+  return checkpoint_impl(x,y);
+}
+
+bool boltzmann::checkpoint( active * x , active * y )
+{
+  return checkpoint_impl(x,y);
 }
 
 bool boltzmann::checkpoint( active ** x , active ** y )
 {
-  TapeState * tp = current_tape();
-
-  /*
-   * Maxwell SVEGP-26 : with no tape open this used to return true on the
-   * first call -- tp->run_counter was 0 -- run the caller's section with nothing
-   * recording, and then dereference a null tape on the second.  End the
-   * loop before it starts instead.
-   */
-  if(!tp){
-    std::cerr << "boltzmann::checkpoint: no tape is open -- call initialize() first.\n";
-    return false;
-  }
-
-  if(!tp->run_counter)
-  {
-    tp->run_counter++;
-    return true;
-  }else
-  {
-    if(tp->run_counter==1)
-    {
-      for( largeint i=0 ; i<tp->dep_rows ; i++ ){
-        for( largeint j=0 ; j<tp->dep_cols ; j++ ){
-          y[i][j].old_idx = y[i][j].idx;
-	  tp->dep_shadow_copy[tp->dep_cols*i+j] = y[i][j].val;
-          tp->proc.save_dependent_index(y[i][j].idx);
-        }
-      }
-
-      tp->proc.finalize(); 
-      tp->proc.disable_profiling();
-      /*
-       * This used to print unconditionally, from inside checkpoint(), on
-       * every rank -- so a p-rank job printed it p times, in the middle of
-       * whatever the caller was doing, and an optimiser calling the library
-       * in a loop printed it once per iteration per rank.  boltzmann::
-       * get_partitions() is the way to ask (Maxwell SVEGP-22); a library
-       * does not narrate.
-       */
-    }else if(tp->run_counter==2)
-    {
-      tp->proc.max_rank_check_memory();
-    }
-
-    //internals::skip_mode = false;
-    internals::restore_values(x,y);
-
-    tp->proc.reinitialize();
-
-    if(!(tp->proc.terminate()))
-    {
-      tp->run_counter++;
-      return true; 
-    }else
-    {
-      for( largeint i=0 ; i<tp->dep_rows ; i++ ){
-        for( largeint j=0 ; j<tp->dep_cols ; j++ ){
-          y[i][j].idx = y[i][j].old_idx;
-	  y[i][j].val = tp->dep_shadow_copy[tp->dep_cols*i+j];
-        }
-      }
-
-      tp->proc.ignore_vertices();//make destructor ignore checking vertex
-      return false;
-    }
-  }
+  return checkpoint_impl(x,y);
 }
 
 int boltzmann::MPI_rank()
