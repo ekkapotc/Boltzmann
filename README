@@ -1,0 +1,47 @@
+Boltzmann -- a pipelined-parallel automatic differentiation library.
+
+Named for the step its serial sibling Maxwell does not take.  Maxwell's demon
+is one gatekeeper deciding, molecule by molecule, what may pass under an
+information budget; Boltzmann is the ensemble -- many identical copies of the
+same system considered at once.  Every rank here runs the same program and
+they differ only in which partition of the tape each one records.
+
+Jacobians by sparse graph vertex elimination, with the tape partitioned across
+MPI ranks: rank r records partitions r, r+p, r+2p, ..., eliminates locally,
+and sends the surviving edges one hop around a ring to rank r-1, which merges
+them and continues.  The last rank in the pipeline assembles the Jacobian.
+
+  make            build build/lib/libboltzmann.a and every example
+  make test       run the whole suite at NP ranks (default 2)
+  make ranks      run the assertion suites at 1, 2, 3 and 4 ranks -- the only
+                  target that checks the invariant specific to being parallel
+  make sanitize   rebuild under AddressSanitizer and run the assertion suites
+  make list       every example, with the arguments it runs with
+  make clean      remove build/
+
+The layout follows Maxwell's: inc/ headers, src/ the library, examples/ one
+directory per example, build/ everything generated and nothing else, and
+backup_20260911/ for six examples that predate the checkpointing protocol and
+no longer compile.
+
+The public surface is boltzmann.hpp.  See ADAPT-FROM-MAXWELL-2026-09-11.md for
+what this library is, how it differs from its serial sibling Maxwell, and
+what is outstanding.
+
+READ BEFORE PUTTING MPI IN THE SECTION BETWEEN checkpoint() CALLS: don't.
+inc/Typedefs.hpp, beside pass_t, explains why and what would have to change.
+
+Outstanding, from the original README:
+  -Serial Reverse Elimination
+  -Checkpoint                        (done; binomial c>1 is still open)
+  -Use exception handling            (done; see break_t / RUN_TO_END)
+  -Add state machine for API robustness
+                                     (superseded: inc/APICallState.hpp was
+                                      never instantiated and is no longer
+                                      built.  The plan is Maxwell's -- make
+                                      the call order unrepresentable through
+                                      RAII types rather than diagnosed at
+                                      runtime.  inc/APICallState.hpp and
+                                      src/APICallState.cpp can be deleted.)
+  -Fix segmentation fault problem when dependents' y.vtx = NULL
+                                     (done)

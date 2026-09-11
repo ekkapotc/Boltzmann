@@ -1,0 +1,2 @@
+RUNARGS =
+include ../common.mk

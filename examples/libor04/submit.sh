@@ -1,0 +1,13 @@
+#!/usr/bin/env zsh
+
+#BSUB -P rwth0166
+#BSUB -J  LIBOR.Nmat200.M10000.ITER20.MPI_CHKT
+#BSUB -o LIBOR.Nmat200.M10000.ITER20.MPI_CHKT%J
+#BSUB -W  02:00
+#BSUB -M   4096
+#BSUB -N
+#BSUB -n  51
+#BSUB -m mpi-bull
+#BSUB -a openmpi
+
+time $MPIEXEC $FLAGS_MPI_BATCH ./main 200 10000 20 
