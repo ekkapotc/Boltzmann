@@ -51,7 +51,6 @@ comm(MPI_COMM_NULL),
 break_mode(BREAK_ON_TARGET),//Maxwell SVEGP-32: what the library has always done
 pass_mode(PASSES_PER_RANK),//what the library has always done
 profiling(true),
-throwable(false),
 dtor_ignore_vertex(false),
 has_vector(false),
 mpi_rank(0),
@@ -176,6 +175,11 @@ largeint Process::generation() const
 largeint Process::get_stale_reads() const
 {
   return stale_reads;
+}
+
+largeint Process::owner_index() const
+{
+  return next_owner_idx;
 }
 
 /*
@@ -824,13 +828,33 @@ void Process::check_memory()
 
         top_owner_idx = top_owner_idx-mpi_size;//update top
 
+        /*
+         * These two resets are load-bearing under BREAK_ON_TARGET and are not
+         * merely the tail's, arriving early: the throw below skips the tail,
+         * and max_rank_check_memory() -- called from checkpoint() once the
+         * exception has been caught -- decides whether a final partial
+         * partition is still outstanding by testing exactly these counters.
+         * Leaving them set would make it run one partition twice.
+         */
 	intmed_count = 0;
         edge_count = 0;
-        //prev_mem_usage = cur_mem_usage;//update memory here
-        next_owner_idx++;
-        //the same value of prev_mem_usage here could be again used in max_rank_check_memory()
-        //again if it is the last partition so we have to update it here so that when
-        //max_rank_check_mememory() is called part_size will equal zero.
+
+        /*
+         * next_owner_idx is NOT incremented here.  It used to be, and then
+         * the shared tail below incremented it again -- so under RUN_TO_END,
+         * where no throw skips that tail, this rank advanced the partition
+         * counter TWICE at its own target boundary and once at every other.
+         * The two break modes are meant to differ only in whether the passive
+         * suffix runs.
+         *
+         * It was invisible: top_owner_idx has just dropped by mpi_size, so
+         * is_proc() is already permanently false for the rest of the pass and
+         * next_owner_idx is then only ever stamped onto actives that no
+         * longer reach a comparison.  Invisible is not the same as harmless
+         * -- 6.4 wants these counters to be a reproducible function of the
+         * operation sequence before a Revolve snapshot can restore them --
+         * and Maxwell, which this was ported from, increments once.
+         */
        
         dtor_ignore_vertex = true;
         partition_count++;
@@ -858,6 +882,26 @@ void Process::check_memory()
          * one of the two things standing between this library and a section
          * that may contain MPI; pass_t in Typedefs.hpp has the other, and the
          * measurement showing that neither is sufficient yet.
+         */
+        /*
+         * No `throwable &&` here, where Maxwell has one.  Maxwell suppresses
+         * the throw on the FIRST productive pass because tgt_owner_idx starts
+         * at the last partition, so that pass's boundary falls at the very end
+         * of the section and the code after it -- the assignment to the
+         * dependent -- still has to run.
+         *
+         * This library reaches the last partition differently: it is finished
+         * by max_rank_check_memory() from inside checkpoint(), after the
+         * section has returned, which is why that function is documented as
+         * unable to throw.  So the first productive pass here may end like any
+         * other, and it does: it throws 259 times over the suite at 1, 2, 3, 4
+         * and 8 ranks.  Adding Maxwell's gate was tried and passes too -- it
+         * only makes those 259 passes run a suffix for nothing.
+         *
+         * The `throwable` member that gated it was carried over with the port,
+         * set in the constructor and in reinitialize(), and never once read.
+         * Removed rather than wired up: half a mechanism reads like an
+         * invariant somebody relies on.
          */
         if(break_mode==BREAK_ON_TARGET){
           throw BreakException();
@@ -1000,7 +1044,6 @@ void Process::reinitialize()
 {
   if(!profiling)
   {
-    this->throwable = true;
     this->dtor_ignore_vertex = false;
     this->next_vertex_idx = this->indep_count+1;//starts from indep_count+1
     this->next_owner_idx = 1;//starts from next_owner_idx=1

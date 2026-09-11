@@ -23,6 +23,10 @@
 
 #include "../../boltzmann.hpp"
 
+/* Internal, on purpose: M-10 pins a counter that is not part of the public
+ * surface and should not become part of it just to be testable. */
+#include "../../inc/TapeState.hpp"
+
 using namespace boltzmann;
 
 static int failures = 0;
@@ -580,6 +584,66 @@ static void m09_harvest_null_off_rank()
   finalize();
 }
 
+
+/* M-10  The partition counter advances exactly once per boundary crossed.
+ *
+ *       check_memory() incremented next_owner_idx inside the recording branch
+ *       AND in the shared tail.  Under BREAK_ON_TARGET the throw skips the
+ *       tail, so that was one increment; under RUN_TO_END nothing skips it and
+ *       the rank advanced twice at its own target boundary.  The two modes are
+ *       meant to differ only in whether the passive suffix runs.
+ *
+ *       Invisible at the time -- is_proc() is already permanently false by
+ *       then -- but it made the counter a function of WHICH RANK OWNED WHAT
+ *       rather than of the operation sequence, and 6.4 needs the second before
+ *       a Revolve snapshot can restore it.  Measured on this tape, the value
+ *       at the end of the section used to be 37 on some passes and 38 on
+ *       others; it is now 37 on all of them, at every rank count.
+ *
+ *       Only RUN_TO_END can be checked: under BREAK_ON_TARGET the end of the
+ *       section is never reached on a pass that records anything.
+ */
+static void m10_partition_counter()
+{
+  initialize(1,1,3000);
+  set_break_mode(RUN_TO_END);
+
+  active x; x = 0.7; independent(x);
+  active y;
+
+  largeint lo = (largeint)-1, hi = 0;
+  int samples = 0;
+
+  run_tape( &x , y , [&]{
+    active u = x;
+    for(int i=0;i<200;i++) u = 0.5*u + sin(u);
+    y = u;
+
+    const largeint c = internals::current_tape()->proc.owner_index();
+    if(c<lo) lo = c;
+    if(c>hi) hi = c;
+    samples++;
+  });
+
+  dependent(y);
+  Jacobian J = harvest(1,1);
+
+  const largeint parts = get_total_partitions();
+
+  finalize();
+
+  long a=(long)lo, b=(long)hi, n=(long)samples, amin=0, bmax=0, nsum=0;
+  MPI_Allreduce(&a,&amin,1,MPI_LONG,MPI_MIN,MPI_COMM_WORLD);
+  MPI_Allreduce(&b,&bmax,1,MPI_LONG,MPI_MAX,MPI_COMM_WORLD);
+  MPI_Allreduce(&n,&nsum,1,MPI_LONG,MPI_SUM,MPI_COMM_WORLD);
+
+  ok("M-10 the section ran to the end on every pass (RUN_TO_END)", nsum>0);
+  ok("M-10 the partition counter is the same at the end of every pass",
+     amin==bmax);
+  ok("M-10 ...and equals the tape's partition count, on every rank",
+     amin==(long)parts);
+}
+
 int main( int argc , char ** argv )
 {
   (void)argc; (void)argv;
@@ -601,6 +665,7 @@ int main( int argc , char ** argv )
   m07_total_partitions();
   m08_stale_active();
   m09_harvest_null_off_rank();
+  m10_partition_counter();
 
   misuse_no_tape();//and again after every tape has been closed
 

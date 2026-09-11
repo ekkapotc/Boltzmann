@@ -60,7 +60,6 @@ public:
   pass_t  pass_mode;//parallel-only; see pass_t in Typedefs.hpp
 
   bool profiling;
-  bool throwable;
   bool dtor_ignore_vertex;
   bool has_vector;
 
@@ -227,6 +226,10 @@ public:
   largeint advance_pass();
   largeint generation() const;
   largeint get_stale_reads() const;
+
+  /* The partition counter, as the caller's section sees it.  Internal: used
+   * by regress to pin "one increment per boundary crossed". */
+  largeint owner_index() const;
 
   //Maxwell SVEGP-32: end a pass by throwing, or by running the section to its end
   void set_break_mode( break_t mode );
