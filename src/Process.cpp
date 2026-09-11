@@ -269,6 +269,42 @@ Vertex * Process::vertex_on_lhs( const active & x )
   return NULL;
 }
 
+/*
+ * RETIRING THE 2016 GUARD, AND KEEPING THE OTHER ONE.
+ *
+ * These three functions carried two guards in front of vPtr->kill():
+ *
+ *     if(x.idx<=next_vertex_idx)        //"bug fix on 08.07.2016"
+ *       if(x.owner_idx==next_owner_idx)
+ *
+ * They look like a pair.  They are not, and instrumenting them settled which
+ * is which -- a counter on each branch, over the whole suite at 1, 2, 3, 4, 5
+ * and 8 ranks in both break modes:
+ *
+ *     blocked by owner_idx                 126960   set_vertex_dead
+ *                                              66   binary_op_ass
+ *     owner_idx differs in vertex_on_rhs  1365672   (1191054 with a live vtx)
+ *     blocked by idx<=next_vertex_idx           0   all three
+ *     guards passed but vtx was NULL            0   all three
+ *
+ * owner_idx is NOT a coarse stand-in for "did this active survive the
+ * checkpoint".  It answers a FINER question -- which PARTITION recorded it --
+ * and a pass walks through many partitions: the ones before the target run
+ * with is_proc() false, so vertex_on_lhs() hands back no vertex while the
+ * operators still stamp owner_idx.  An active from such a partition is
+ * current by generation and has no vertex to kill.  Removing that guard would
+ * dereference NULL a hundred thousand times over this suite.  It stays.
+ *
+ * x.idx<=next_vertex_idx is the one active::gen made redundant, and not only
+ * empirically.  Within a pass, indices are handed out from next_vertex_idx,
+ * which only increases, so anything stamped with the current generation has
+ * idx <= next_vertex_idx by construction; independents sit at 1..indep_count
+ * and next_vertex_idx starts above them.  The case it existed for is an
+ * active carrying an index from the PROFILING pass, where next_vertex_idx ran
+ * up over the whole tape before reinitialize() reset it -- and profiling
+ * creates no vertices, so those actives have gen 0 and are now adopted before
+ * they reach here.  It is replaced by the assertion it always was.
+ */
 void Process::set_vertex_dead( const active & x )
 {
   /*
@@ -286,14 +322,13 @@ void Process::set_vertex_dead( const active & x )
   {
     if(x.idx)
     { 
-      if(x.idx<=next_vertex_idx)//bug fix on 08.07.2016
+      assert( x.idx<=next_vertex_idx );//see the note above: gen guarantees it
+
+      if(x.owner_idx==next_owner_idx)//WHICH PARTITION, not which pass
       {
-        if(x.owner_idx==next_owner_idx)
-        {
-          Vertex * vPtr = x.vtx;
-          vPtr->kill();
-        }
-       }
+        Vertex * vPtr = x.vtx;
+        vPtr->kill();
+      }
     }//end of x.idx
 
   }//end of is_proc()
@@ -319,44 +354,39 @@ Vertex * Process::set_vertex_dead_for_unary_op_ass( const active & x )
   {
     if(x.idx)
     { 
-      if(x.idx<=next_vertex_idx)//bug fix on 08.07.2016
+      assert( x.idx<=next_vertex_idx );//see set_vertex_dead()
+
+      if(x.owner_idx==next_owner_idx)//WHICH PARTITION, not which pass
       {
-        if(x.owner_idx==next_owner_idx)
+        Vertex * vPtr = x.vtx;
+        vPtr->kill();
+        x.idx = 0;
+        x.vtx = NULL;
+        return vPtr;
+      }else
+      {
+        if(x.vtx)
         {
           Vertex * vPtr = x.vtx;
-          vPtr->kill();
           x.idx = 0;
           x.vtx = NULL;
           return vPtr;
         }else
         {
-          if(x.vtx)
-          {
-            Vertex * vPtr = x.vtx;
-            x.idx = 0;
-            x.vtx = NULL;
-            return vPtr;
-          }else
-          {
-            Vertex * vPtr = new Vertex( x.idx , x.owner_idx );
-  
- 	    vertex_counter++;//debug
+          Vertex * vPtr = new Vertex( x.idx , x.owner_idx );
 
-            if(x.idx==x.old_idx)
-            { 
-              vPtr->dep_vertex = true; 
-            }
+          vertex_counter++;//debug
 
-            intmed_vec.push_back(vPtr);
-            x.idx = 0;
-            x.vtx = NULL;
-            return vPtr;
+          if(x.idx==x.old_idx)
+          { 
+            vPtr->dep_vertex = true; 
           }
+
+          intmed_vec.push_back(vPtr);
+          x.idx = 0;
+          x.vtx = NULL;
+          return vPtr;
         }
-      }else{//bug fix on 08.07.2016
-	x.idx = 0;
-	x.vtx = NULL;
-	return NULL;
       }
     }
   }
@@ -375,50 +405,42 @@ Vertex * Process::set_vertex_dead_for_binary_op_ass( const active & x , bool & m
     return NULL;
   }
 
+  assert( x.idx<=next_vertex_idx );//see set_vertex_dead(); replaces the 2016 guard
+
   if(is_proc())
   {
     if(x.idx)
     { 
-      if(x.idx<=next_vertex_idx)
+      if(x.owner_idx==next_owner_idx)//WHICH PARTITION, not which pass
       {
-        if(x.owner_idx==next_owner_idx)
+        Vertex * vPtr = x.vtx;
+        vPtr->kill();
+        x.vtx = NULL;
+        return vPtr;
+      }else
+      {
+        if(x.vtx)
         {
           Vertex * vPtr = x.vtx;
-          vPtr->kill();
           x.vtx = NULL;
           return vPtr;
         }else
         {
-          if(x.vtx)
-	  {
-            Vertex * vPtr = x.vtx;
-            x.vtx = NULL;
-            return vPtr;
-          }else
-  	  {
-            Vertex * vPtr = new Vertex( x.idx , x.owner_idx );
+          Vertex * vPtr = new Vertex( x.idx , x.owner_idx );
 
-	    vertex_counter++;//debug
-      
-            if(x.idx==x.old_idx){
-              vPtr->dep_vertex = true;
-            }
+          vertex_counter++;//debug
 
-            intmed_vec.push_back(vPtr);
-            x.vtx = NULL;
-            return vPtr;
+          if(x.idx==x.old_idx){
+            vPtr->dep_vertex = true;
           }
+
+          intmed_vec.push_back(vPtr);
+          x.vtx = NULL;
+          return vPtr;
         }
-      }else{
-        meaningful = false;
-        x.vtx = NULL;
-	return NULL;
       }
     }
   }
-
-  if(x.idx>next_vertex_idx) 
-    meaningful = false;
 
   x.vtx = NULL;//reset vtx to NULL
   return NULL;
